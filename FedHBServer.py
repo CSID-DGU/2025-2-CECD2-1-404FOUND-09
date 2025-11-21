@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import torch
-from advanced_model import AdvancedEnhancerModel, load_advanced_diabetes_data
+from improved_model import ImprovedEnhancerModel
 from aggregation import CommunicationEfficientFedHB
 import uvicorn
 import os
@@ -55,7 +55,12 @@ app = FastAPI()
 # CORS 설정 추가
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # Next.js 클라이언트 주소
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8081",
+        "http://127.0.0.1:8081"
+    ],  # 허용 클라이언트 주소
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -87,7 +92,7 @@ OPTIMIZED_PARAMS = {
     'scheduler': 'cosine'
 }
 
-global_model = AdvancedEnhancerModel(
+global_model = ImprovedEnhancerModel(
     input_dim=input_dim, 
     num_classes=num_classes,
     hidden_dims=OPTIMIZED_PARAMS['hidden_dims'],
@@ -129,7 +134,7 @@ if os.path.exists("global_model.pth"):
                 model_data = {
                     'state_dict': global_model.state_dict(),
                     'input_dim': 8,
-                    'model_type': 'AdvancedEnhancerModel',
+                    'model_type': 'ImprovedEnhancerModel',
                     'version': '2.0'
                 }
                 torch.save(model_data, "global_model.pth")
@@ -141,7 +146,7 @@ if os.path.exists("global_model.pth"):
             model_data = {
                 'state_dict': global_model.state_dict(),
                 'input_dim': 8,
-                'model_type': 'AdvancedEnhancerModel',
+                'model_type': 'ImprovedEnhancerModel',
                 'version': '2.0'
             }
             torch.save(model_data, "global_model.pth")
@@ -162,7 +167,7 @@ if os.path.exists("global_model.pth"):
         model_data = {
             'state_dict': global_model.state_dict(),
             'input_dim': 8,  # 고정된 입력 차원
-            'model_type': 'AdvancedEnhancerModel',
+            'model_type': 'ImprovedEnhancerModel',
             'version': '2.0'
         }
         torch.save(model_data, "global_model.pth")
@@ -171,7 +176,7 @@ else:
     model_data = {
         'state_dict': global_model.state_dict(),
         'input_dim': 8,  # 고정된 입력 차원
-        'model_type': 'AdvancedEnhancerModel',
+        'model_type': 'ImprovedEnhancerModel',
         'version': '2.0'
     }
     torch.save(model_data, "global_model.pth")
@@ -633,6 +638,7 @@ async def aggregate(request: UpdateRequest):
         'c1_list': c1_list,
         'num_samples': request.num_samples,
         'loss': request.loss,
+        'accuracy': request.accuracy,
         'timestamp': time.time()
     }
     
@@ -687,11 +693,15 @@ async def aggregate(request: UpdateRequest):
         # FedAvg 방식: 샘플 수 기반 가중치 계산
         client_weights = {}
         total_samples = sum(update['num_samples'] for update in round_buffer.values())
+        weighted_loss = 0.0
+        weighted_accuracy = 0.0
         
         for client_id, update in round_buffer.items():
             # 각 클라이언트의 샘플 수에 비례한 가중치
             weight = update['num_samples'] / total_samples
             client_weights[client_id] = weight
+            weighted_loss += float(update.get('loss', 0.0)) * weight
+            weighted_accuracy += float(update.get('accuracy', 0.0)) * weight
         
         log_info(f"클라이언트 가중치: {[(cid, f'{w:.3f}') for cid, w in client_weights.items()]}")
         
@@ -758,15 +768,29 @@ async def aggregate(request: UpdateRequest):
         log_debug(f"남은 활성 라운드: {list(updates_buffer.keys())}")
         
         # 5단계: 클라이언트로 암호화된 평균 결과 전송
+        log_info(f"라운드 {request.round_id} 집계 요약 - 손실: {weighted_loss:.4f}, 정확도: {weighted_accuracy:.2f}%")
         response = {
             "c0_list": [[[float(c.real), float(c.imag)] for c in c0] for c0 in c0_list_agg],
             "c1_list": [[[float(c.real), float(c.imag)] for c in c1] for c1 in c1_list_agg],
-            "original_size": request.original_size
+            "original_size": request.original_size,
+            "round_summary": {
+                "round_id": request.round_id,
+                "aggregation_reason": aggregation_reason,
+                "num_clients": len(client_weights),
+                "total_samples": total_samples,
+                "weighted_loss": weighted_loss,
+                "weighted_accuracy": weighted_accuracy
+            }
         }
         log_success(f"클라이언트로 암호화된 평균 결과 전송 완료")
         return response
     
-    return {"status": "waiting"}
+    return {
+        "status": "waiting",
+        "round_id": request.round_id,
+        "clients_received": len(updates_buffer.get(request.round_id, {})),
+        "aggregation_reason": aggregation_reason
+    }
 
 def save_global_model_atomic(model, path="global_model.pth"):
     tmp_path = path + ".tmp"
@@ -775,8 +799,8 @@ def save_global_model_atomic(model, path="global_model.pth"):
 
 if __name__ == "__main__":
     log_success("=== FedHybrid 서버 시작 ===")
-    log_info(f"서버 주소: http://0.0.0.0:8000")
+    log_info(f"서버 주소: http://0.0.0.0:8082")
     log_info(f"CKKS 파라미터: N={N}, z_q={z_q}")
     log_info(f"모델 설정: input_dim={input_dim}, num_classes={num_classes}")
     log_info("서버가 시작되었습니다. 클라이언트 연결을 기다리는 중...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8082)

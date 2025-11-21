@@ -18,7 +18,7 @@ def mod_x4_plus_1(poly):
             result[idx] += poly[i]
     return result
 
-# 정수 계수로 반올림 함수 (정수 기반) - 복소수 경고 해결
+# 정수 계수로 반올림 함수 (정수 기반)
 def round_to_integer(coeffs):
     # 복소수인 경우 실수부만 사용
     if np.iscomplexobj(coeffs):

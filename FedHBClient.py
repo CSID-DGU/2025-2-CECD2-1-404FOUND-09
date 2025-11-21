@@ -1,9 +1,13 @@
 import torch
 import requests
 from model import client_update_full, load_diabetes_data
-from improved_model import ImprovedEnhancerModel
+from improved_model import (
+    ImprovedEnhancerModel,
+    load_improved_diabetes_data,
+    improved_client_update,
+)
 from aggregation import CommunicationEfficientFedHB
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 import torch.nn as nn
 import os
 import numpy as np
@@ -26,7 +30,7 @@ rescale_q = z_q  # 리스케일링용 스케일
 N = 4  # 슬롯 수
 s = np.array([1+0j, 1+0j, 0+0j, 0+0j], dtype=np.complex128)  # 비밀키
 
-SERVER_URL = "http://localhost:8000"
+SERVER_URL = "http://210.94.185.206:8082"
 NUM_ROUNDS = 5
 
 def evaluate_local_accuracy(model, data_loader, device):
@@ -252,6 +256,7 @@ def predict_diabetes_probability_with_explanation(model, data_loader, feature_na
     probabilities = []
     predictions = []
     explanations = []
+    complication_probabilities = []
     
     print(f"=== 해석 가능한 예측 시작 ===")
     print(f"모델 상태: {model.training}")
@@ -264,7 +269,20 @@ def predict_diabetes_probability_with_explanation(model, data_loader, feature_na
     with torch.no_grad():
         for batch_idx, (x, _) in enumerate(data_loader):
             x = x.to(device)
-            outputs = model(x)
+            complication_logits = None
+            try:
+                if hasattr(model, 'complication_head'):
+                    outputs_tuple = model(x, return_aux=True)
+                    if isinstance(outputs_tuple, tuple) and len(outputs_tuple) >= 4:
+                        outputs = outputs_tuple[0]
+                        complication_logits = outputs_tuple[3]
+                    else:
+                        outputs = outputs_tuple
+                else:
+                    outputs = model(x)
+            except TypeError:
+                # 일부 모델은 return_aux 인자를 지원하지 않으므로 기본 forward 사용
+                outputs = model(x)
             
             # 디버깅: 첫 번째 배치의 출력 확인
             if batch_idx == 0:
@@ -288,6 +306,10 @@ def predict_diabetes_probability_with_explanation(model, data_loader, feature_na
             probabilities.extend(batch_probs)
             predictions.extend(batch_preds)
             
+            if complication_logits is not None:
+                comp_probs = torch.softmax(complication_logits, dim=1)[:, 1].cpu().numpy()
+                complication_probabilities.extend(comp_probs)
+            
             # 첫 번째 배치의 첫 번째 샘플에 대한 상세 설명
             if batch_idx == 0:
                 print(f"\n첫 번째 샘플 상세 분석:")
@@ -302,6 +324,8 @@ def predict_diabetes_probability_with_explanation(model, data_loader, feature_na
     
     probabilities = np.array(probabilities)
     predictions = np.array(predictions)
+    complication_probabilities = (np.array(complication_probabilities)
+                                  if complication_probabilities else None)
     
     print(f"\n=== 전체 예측 완료 ===")
     print(f"확률 범위: {probabilities.min():.4f} ~ {probabilities.max():.4f}")
@@ -309,9 +333,10 @@ def predict_diabetes_probability_with_explanation(model, data_loader, feature_na
     print(f"예측 분포: {np.bincount(predictions)}")
     print(f"고유 확률 값 개수: {len(np.unique(probabilities))}")
     
-    return probabilities, predictions, feature_importance
+    return probabilities, predictions, complication_probabilities, feature_importance
 
-def save_results_to_excel(original_data, probabilities, predictions, feature_importance=None, output_path='prediction_results.xlsx'):
+def save_results_to_excel(original_data, probabilities, predictions, complication_probs=None,
+                          feature_importance=None, output_path='prediction_results.xlsx'):
     """결과를 엑셀 파일로 저장 (간소화 버전)"""
     try:
         print(f"결과 저장 시작: {len(probabilities)}개 데이터", flush=True)
@@ -319,6 +344,8 @@ def save_results_to_excel(original_data, probabilities, predictions, feature_imp
         # NaN 값 처리
         probabilities = np.nan_to_num(probabilities, nan=0.0, posinf=1.0, neginf=0.0)
         predictions = np.nan_to_num(predictions, nan=0, posinf=1, neginf=0).astype(int)
+        if complication_probs is not None:
+            complication_probs = np.nan_to_num(complication_probs, nan=0.0, posinf=1.0, neginf=0.0)
         
         # 데이터 크기 제한 (메모리 및 시간 절약)
         max_rows = 10000  # 최대 10,000행으로 제한
@@ -329,6 +356,8 @@ def save_results_to_excel(original_data, probabilities, predictions, feature_imp
             original_data = original_data.iloc[top_indices]
             probabilities = probabilities[top_indices]
             predictions = predictions[top_indices]
+            if complication_probs is not None:
+                complication_probs = complication_probs[top_indices]
         
         # 원본 데이터에 예측 결과 추가
         result_df = original_data.copy()
@@ -342,6 +371,8 @@ def save_results_to_excel(original_data, probabilities, predictions, feature_imp
         result_df['당뇨병_확률'] = probabilities
         result_df['예측_결과'] = predictions
         result_df['예측_라벨'] = ['당뇨병' if p == 1 else '정상' for p in predictions]
+        if complication_probs is not None and len(complication_probs) == len(result_df):
+            result_df['합병증_확률'] = complication_probs
         
         # 확률별로 정렬
         result_df = result_df.sort_values('당뇨병_확률', ascending=False)
@@ -390,15 +421,25 @@ def main(input_file=None):
         data_file = 'diabetic_data.csv'
     
     # 데이터셋 준비 (개선된 버전 사용)
+    feature_scaler = None
+    class_weight_summary = None
     try:
-        from improved_model import load_improved_diabetes_data
-        train_dataset, test_dataset, class_weights, selected_features = load_improved_diabetes_data(data_file)
+        (
+            train_dataset,
+            test_dataset,
+            class_weights,
+            selected_features,
+            feature_scaler,
+            class_weight_summary,
+        ) = load_improved_diabetes_data(data_file)
         train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
         test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=0)
         input_dim = train_dataset.X.shape[1]
         print(f"개선된 데이터 로드 완료 - 입력 차원: {input_dim}", flush=True)
         print(f"선택된 특성: {selected_features}", flush=True)
-        print(f"클래스 가중치: {class_weights}", flush=True)
+        print(f"클래스 가중치 텐서: {class_weights}", flush=True)
+        if class_weight_summary:
+            print(f"클래스 가중치 요약: {class_weight_summary}", flush=True)
     except Exception as e:
         print(f"개선된 데이터 로드 실패, 기본 버전 사용: {e}", flush=True)
         try:
@@ -408,6 +449,7 @@ def main(input_file=None):
             input_dim = train_dataset.X.shape[1]
             class_weights = None
             selected_features = None
+            feature_scaler = None
             print(f"기본 데이터 로드 완료 - 입력 차원: {input_dim}", flush=True)
         except Exception as e2:
             print(f"데이터 로드 완전 실패: {e2}", flush=True)
@@ -459,20 +501,33 @@ def main(input_file=None):
         training_start_time = time.time()
         accuracy = 0.0  # 기본값
         try:
-            from improved_model import improved_client_update
             updated_model, avg_loss, epochs, num_samples, accuracy = improved_client_update(
-                client_model, global_model, train_loader, nn.CrossEntropyLoss(), r, device, class_weights
+                client_model,
+                global_model,
+                train_loader,
+                nn.CrossEntropyLoss(),
+                r,
+                device,
+                class_weights=class_weights,
             )
             print(f"✅ 개선된 학습 함수 사용 완료", flush=True)
         except Exception as e:
             print(f"개선된 학습 실패, 기본 버전 사용: {e}", flush=True)
             result = client_update_full(
-                client_model, global_model, train_loader, nn.CrossEntropyLoss(), r, device,
-                use_kd=False, use_fedprox=False, use_pruning=False  # 안정성을 위해 모든 고급 기능 비활성화
+                client_model,
+                global_model,
+                train_loader,
+                nn.CrossEntropyLoss(),
+                r,
+                device,
+                use_kd=False,
+                use_fedprox=False,
+                use_pruning=False,
+                class_weights=class_weights,
             )
             if len(result) == 4:
                 updated_model, avg_loss, epochs, num_samples = result
-                accuracy = 0.0  # 기본 함수는 정확도를 반환하지 않음
+                accuracy = 0.0
             else:
                 updated_model, avg_loss, epochs, num_samples, accuracy = result
         training_end_time = time.time()
@@ -624,44 +679,54 @@ def main(input_file=None):
         if 'readmitted' in df_for_prediction.columns:
             df_for_prediction['readmitted'] = df_for_prediction['readmitted'].map(lambda x: 0 if x == 'NO' else 1)
         
-        # 학습과 동일한 특성 선택 (8개 고정 특성)
-        fixed_features = [
-            'admission_source_id', 'time_in_hospital', 'num_procedures', 
-            'num_medications', 'number_outpatient', 'number_emergency', 
-            'number_inpatient', 'number_diagnoses'
-        ]
+        if selected_features:
+            missing = [col for col in selected_features if col not in df_for_prediction.columns]
+            if missing:
+                raise ValueError(f"예측에 필요한 특성을 찾을 수 없습니다: {missing}")
+            features_for_prediction = selected_features
+        else:
+            fixed_features = [
+                'admission_source_id', 'time_in_hospital', 'num_procedures', 
+                'num_medications', 'number_outpatient', 'number_emergency', 
+                'number_inpatient', 'number_diagnoses'
+            ]
+            available_features = [col for col in fixed_features if col in df_for_prediction.columns]
+            if len(available_features) < len(fixed_features):
+                numeric_cols = df_for_prediction.select_dtypes(include=['int64', 'float64']).columns.tolist()
+                numeric_cols = [col for col in numeric_cols if col != 'readmitted']
+                remaining_cols = [col for col in numeric_cols if col not in available_features]
+                needed = len(fixed_features) - len(available_features)
+                available_features.extend(remaining_cols[:needed])
+            features_for_prediction = available_features[:len(fixed_features)]
         
-        # 사용 가능한 특성만 선택
-        available_features = [col for col in fixed_features if col in df_for_prediction.columns]
-        
-        # 부족한 경우 다른 숫자형 특성 추가
-        if len(available_features) < 8:
-            numeric_cols = df_for_prediction.select_dtypes(include=['int64', 'float64']).columns.tolist()
-            numeric_cols = [col for col in numeric_cols if col != 'readmitted']
-            remaining_cols = [col for col in numeric_cols if col not in available_features]
-            available_features.extend(remaining_cols[:8-len(available_features)])
-        
-        # 정확히 8개 특성만 사용
-        selected_features_for_prediction = available_features[:8]
-        
-        # 선택된 특성으로 데이터 준비
-        X_pred = df_for_prediction[selected_features_for_prediction].values.astype('float32')
+        X_pred = df_for_prediction[features_for_prediction].values.astype('float32')
+        X_pred = np.nan_to_num(X_pred, nan=0.0, posinf=1.0, neginf=0.0)
         print(f"예측용 데이터 준비: {X_pred.shape}")
-        print(f"예측에 사용되는 특성: {selected_features_for_prediction}")
+        print(f"예측에 사용되는 특성: {features_for_prediction}")
         
-        # 스케일링 적용 (학습과 동일한 방식)
-        from sklearn.preprocessing import StandardScaler
-        scaler = StandardScaler()
-        X_pred_scaled = scaler.fit_transform(X_pred)
+        if feature_scaler is not None:
+            X_pred_scaled = feature_scaler.transform(X_pred)
+        else:
+            from sklearn.preprocessing import StandardScaler
+            temp_scaler = StandardScaler()
+            X_pred_scaled = temp_scaler.fit_transform(X_pred)
         X_pred_scaled = np.nan_to_num(X_pred_scaled, nan=0.0, posinf=1.0, neginf=-1.0)
         
         print(f"스케일링 후 데이터 형태: {X_pred_scaled.shape}")
         print(f"스케일링 후 NaN 개수: {np.isnan(X_pred_scaled).sum()}")
         
-        # 예측 수행 (스케일링된 데이터 사용)
-        probabilities, predictions, feature_importance = predict_diabetes_probability_with_explanation(client_model, 
-            DataLoader(list(zip(X_pred_scaled, [0]*len(X_pred_scaled))), batch_size=64, shuffle=False), 
-            selected_features_for_prediction, device)
+        prediction_dataset = TensorDataset(
+            torch.tensor(X_pred_scaled, dtype=torch.float32),
+            torch.zeros(len(X_pred_scaled), dtype=torch.long)
+        )
+        prediction_loader = DataLoader(prediction_dataset, batch_size=64, shuffle=False)
+        
+        probabilities, predictions, complication_probs, feature_importance = predict_diabetes_probability_with_explanation(
+            client_model,
+            prediction_loader,
+            features_for_prediction,
+            device
+        )
         
         # 원본 데이터에 예측 결과 추가 (원본 형식 유지)
         result_df = original_df.copy()
@@ -672,7 +737,7 @@ def main(input_file=None):
         # 확률별로 정렬 (선택사항)
         result_df = result_df.sort_values('당뇨병_확률', ascending=False)
         
-        success = save_results_to_excel(result_df, probabilities, predictions, feature_importance)
+        success = save_results_to_excel(result_df, probabilities, predictions, complication_probs, feature_importance)
         
         if success:
             print("=== 학습 및 예측 완료 ===", flush=True)
