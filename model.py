@@ -1065,8 +1065,13 @@ def evaluate_fedet(fedet, test_loader, round_idx):
     }
 
 
-def export_patient_predictions(fedet, data_loader, output_path="patient_predictions.csv"):
-    """각 환자 샘플별 확률/예측을 CSV로 저장"""
+def export_patient_predictions(
+    fedet,
+    data_loader,
+    output_csv_path="patient_predictions.csv",
+    output_excel_path="prediction_results.xlsx"
+):
+    """각 환자 샘플별 확률/예측을 CSV와 XLSX로 저장"""
     fedet.enhancer.eval()
     records = []
     sample_idx = 0
@@ -1102,8 +1107,47 @@ def export_patient_predictions(fedet, data_loader, output_path="patient_predicti
                 })
                 sample_idx += 1
     df = pd.DataFrame(records)
-    df.to_csv(output_path, index=False)
-    print(f"=== 환자별 예측 결과 저장 완료: {output_path} ({len(df)} rows) ===", flush=True)
+    
+    # 합병증 요약 컬럼 추가 (엑셀에서 직관적으로 보기 위함)
+    def _summarize_complication(prob, high_thr=0.5, medium_thr=0.3):
+        if prob >= high_thr:
+            return "High (>=50%)"
+        if prob >= medium_thr:
+            return "Moderate (30~50%)"
+        return "Low (<30%)"
+    
+    df["complication_summary"] = df["complication_admission_prob"].apply(_summarize_complication)
+    
+    # 한글 컬럼명으로 변환
+    korean_columns = {
+        "index": "환자_인덱스",
+        "diabetes_prob": "당뇨병_확률",
+        "diabetes_pred": "당뇨병_예측",
+        "readmission_prob": "재입원_확률",
+        "readmission_pred": "재입원_예측",
+        "complication_prob": "합병증_확률",
+        "complication_pred": "합병증_예측",
+        "stay_bucket_pred": "입원일수_구간",
+        "label_diabetes": "정답_당뇨병",
+        "label_readmission": "정답_재입원",
+        "label_complication": "정답_합병증",
+        "complication_admission_prob": "합병증_입원확률",
+        "complication_summary": "합병증_요약"
+    }
+    df = df.rename(columns=korean_columns)
+    
+    # CSV 저장 (기존 호환성 유지)
+    if output_csv_path:
+        df.to_csv(output_csv_path, index=False)
+        print(f"=== 환자별 예측 결과 CSV 저장 완료: {output_csv_path} ({len(df)} rows) ===", flush=True)
+    
+    # 엑셀 저장 (요청: 단일 XLSX 파일)
+    if output_excel_path:
+        try:
+            df.to_excel(output_excel_path, index=False)
+            print(f"=== 환자별 예측 결과 XLSX 저장 완료: {output_excel_path} ({len(df)} rows) ===", flush=True)
+        except Exception as excel_err:
+            print(f"[경고] XLSX 저장 실패 ({excel_err}), CSV만 유지됩니다.", flush=True)
 
 # ----------------------------
 # 4. 기존 모델 정의 (SimpleCNN)
@@ -1516,4 +1560,9 @@ if __name__ == "__main__":
     
     # 환자별 확률 Export
     export_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
-    export_patient_predictions(fedet, export_loader, output_path="patient_predictions.csv")
+    export_patient_predictions(
+        fedet,
+        export_loader,
+        output_csv_path="patient_predictions.csv",
+        output_excel_path="prediction_results.xlsx"
+    )
