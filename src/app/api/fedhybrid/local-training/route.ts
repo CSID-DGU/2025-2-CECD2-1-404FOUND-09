@@ -105,7 +105,8 @@ export async function POST(request: NextRequest) {
     }
 
     // FedHybrid-AI 클라이언트 실행 (FedHBClient.py 사용)
-    const aiDir = path.join(process.cwd(), '..', 'FedHybrid-AI');
+    // 경로 수정: client/FedHybrid-Client -> ai/FedHybrid-AI
+    const aiDir = path.resolve(process.cwd(), '..', '..', 'ai', 'FedHybrid-AI');
     const pythonScript = path.join(aiDir, 'FedHBClient.py');
 
     console.log('FedHybrid-AI 디렉토리:', aiDir);
@@ -123,12 +124,91 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'FedHBClient.py 파일을 찾을 수 없습니다.' }, { status: 500 });
     }
 
-    // 간단한 응답으로 변경 (실제 Python 프로세스 실행은 별도로 처리)
+    // 업로드된 파일을 FedHybrid-AI 디렉토리로 복사 (diabetic_data.csv 또는 --input_file 인자로 사용)
+    const targetDataPath = path.join(aiDir, 'diabetic_data.csv');
+    try {
+      fs.copyFileSync(finalFilePath, targetDataPath);
+      console.log('데이터 파일 복사 완료:', targetDataPath);
+    } catch (copyError) {
+      console.error('파일 복사 실패:', copyError);
+      return NextResponse.json({ 
+        error: '데이터 파일을 복사할 수 없습니다.',
+        details: copyError instanceof Error ? copyError.message : String(copyError)
+      }, { status: 500 });
+    }
+
+    // Python 프로세스 실행
+    const pythonBin = process.env.PYTHON_BIN || 'python3';
+    console.log('Python 실행 파일:', pythonBin);
+    console.log('FedHBClient.py 실행 시작...');
+
+    const pythonProcess = spawn(pythonBin, [pythonScript, '--input_file', targetDataPath], {
+      cwd: aiDir,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED: '1', // Python 출력 버퍼링 비활성화 (실시간 로그)
+      }
+    });
+
+    // 표준 출력을 실시간으로 전역 로그 핸들러로 전달
+    pythonProcess.stdout.on('data', (data) => {
+      const output = data.toString();
+      console.log('[Python stdout]', output);
+      
+      // 전역 로그 핸들러가 있으면 실시간으로 전달
+      if ((global as any).sendLogToClient) {
+        const lines = output.split('\n').filter((line: string) => line.trim());
+        lines.forEach((line: string) => {
+          (global as any).sendLogToClient(line, 'python_output');
+        });
+      }
+    });
+
+    // 표준 에러를 실시간으로 전역 로그 핸들러로 전달
+    pythonProcess.stderr.on('data', (data) => {
+      const output = data.toString();
+      console.error('[Python stderr]', output);
+      
+      // 전역 로그 핸들러가 있으면 실시간으로 전달
+      if ((global as any).sendLogToClient) {
+        const lines = output.split('\n').filter((line: string) => line.trim());
+        lines.forEach((line: string) => {
+          (global as any).sendLogToClient(line, 'python_error');
+        });
+      }
+    });
+
+    // 프로세스 종료 처리
+    pythonProcess.on('close', (code) => {
+      console.log(`Python 프로세스 종료: 코드 ${code}`);
+      
+      if ((global as any).sendLogToClient) {
+        if (code === 0) {
+          (global as any).sendLogToClient('✅ FedHybrid 클라이언트 학습이 성공적으로 완료되었습니다!', 'success');
+          (global as any).sendLogToClient('📊 예측 결과 파일이 생성되었습니다.', 'success');
+        } else {
+          (global as any).sendLogToClient(`❌ 학습이 오류로 종료되었습니다 (코드: ${code})`, 'error');
+        }
+      }
+    });
+
+    // 프로세스 오류 처리
+    pythonProcess.on('error', (error) => {
+      console.error('Python 프로세스 오류:', error);
+      if ((global as any).sendLogToClient) {
+        (global as any).sendLogToClient(`❌ Python 프로세스 오류: ${error.message}`, 'error');
+      }
+    });
+
+    // 즉시 응답 반환 (프로세스는 백그라운드에서 계속 실행)
     return NextResponse.json({ 
       success: true, 
-      message: '파일이 성공적으로 업로드되었습니다.',
+      message: 'FedHybrid 클라이언트 학습이 시작되었습니다. 실시간 로그를 확인하세요.',
+      processId: pythonProcess.pid,
       fileName: fileName,
-      filePath: finalFilePath
+      filePath: finalFilePath,
+      targetPath: targetDataPath
     });
 
   } catch (error) {
@@ -143,7 +223,8 @@ export async function GET() {
     // TODO: 프로덕션 환경에서는 적절한 인증 구현 필요
 
     // 결과 파일 확인
-    const aiDir = path.join(process.cwd(), '..', 'FedHybrid-AI');
+    // 경로 수정: client/FedHybrid-Client -> ai/FedHybrid-AI
+    const aiDir = path.resolve(process.cwd(), '..', '..', 'ai', 'FedHybrid-AI');
     const resultPath = path.join(aiDir, 'prediction_results.xlsx');
     
     if (fs.existsSync(resultPath)) {

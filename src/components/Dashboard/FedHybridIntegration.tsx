@@ -125,6 +125,39 @@ export default function FedHybridIntegration({
 
   // 실시간 로그 업데이트 함수 (성능 최적화)
   const updateTrainingLog = (message: string) => {
+    // ROUND_INFO JSON 파싱 (우선 처리, 로그에 추가하지 않음)
+    if (message.includes("ROUND_INFO:")) {
+      try {
+        const jsonStr = message.split("ROUND_INFO:")[1]?.trim();
+        if (jsonStr) {
+          const roundInfo = JSON.parse(jsonStr);
+          const { round, accuracy_after, accuracy_before, loss, duration } = roundInfo;
+          
+          // 라운드 정보 업데이트
+          lastRoundRef.current = round;
+          
+          // 정확도 데이터 업데이트 (학습 후 정확도 사용)
+          setAccuracyData((prev) => {
+            // 같은 라운드가 있으면 업데이트, 없으면 추가
+            const existingIndex = prev.findIndex((d) => d.round === round);
+            const newData = { round, accuracy: accuracy_after };
+            
+            if (existingIndex >= 0) {
+              const updated = [...prev];
+              updated[existingIndex] = newData;
+              return updated;
+            } else {
+              return [...prev, newData].sort((a, b) => a.round - b.round);
+            }
+          });
+        }
+      } catch (error) {
+        console.error("ROUND_INFO 파싱 오류:", error, message);
+      }
+      // ROUND_INFO는 로그에 추가하지 않음 (차트 데이터만 업데이트)
+      return;
+    }
+
     const timestamp = new Date().toLocaleTimeString();
     const logEntry = `[${timestamp}] ${message}`;
 
@@ -146,7 +179,7 @@ export default function FedHybridIntegration({
       return newLogs;
     });
 
-    // 로그에서 차트 데이터 추출
+    // 기존 정규식 파싱 (하위 호환성)
     const roundMatch = message.match(/라운드\s*(\d+)(?:\/\d+)?\s*시작/);
     const accMatch = message.match(/🎯\s*학습 후 정확도:\s*([\d.]+)%/);
     if (accMatch) {
@@ -186,9 +219,29 @@ export default function FedHybridIntegration({
           if (data.type === "python_output") {
             // Python 출력 로그
             updateTrainingLog(`🐍 ${data.message}`);
+            
+            // 학습 완료 키워드 감지 (엑셀 파일 생성 완료 후에만)
+            // "엑셀 파일 생성 완료" 메시지가 포함된 경우에만 학습 완료로 인식
+            if (data.message.includes("엑셀 파일 생성 완료")) {
+              setTrainingStatus("로컬 학습이 완료되었습니다!");
+              // 학습 완료 이벤트 발생 (ExcelResultViewer 새로고침 트리거)
+              const trainingCompleteEvent = new CustomEvent("training-complete", {
+                detail: { timestamp: new Date().toISOString() },
+              });
+              window.dispatchEvent(trainingCompleteEvent);
+            }
           } else if (data.type === "python_error") {
             // Python 에러 로그
             updateTrainingLog(`❌ ${data.message}`);
+          } else if (data.type === "success") {
+            // 학습 성공 메시지
+            updateTrainingLog(data.message);
+            setTrainingStatus("로컬 학습이 완료되었습니다!");
+            // 학습 완료 이벤트 발생
+            const trainingCompleteEvent = new CustomEvent("training-complete", {
+              detail: { timestamp: new Date().toISOString() },
+            });
+            window.dispatchEvent(trainingCompleteEvent);
           } else if (data.type === "heartbeat") {
             // 하트비트는 표시하지 않음
             return;
@@ -204,8 +257,16 @@ export default function FedHybridIntegration({
 
     eventSource.onerror = (error) => {
       console.error("로그 스트리밍 오류:", error);
-      updateTrainingLog("❌ 로그 스트리밍 연결 오류");
-      eventSource.close();
+      // 연결이 정상적으로 종료된 경우 (readyState === 2)는 오류가 아님
+      if (eventSource.readyState === EventSource.CLOSED) {
+        updateTrainingLog("🔄 실시간 로그 스트리밍 연결 종료");
+        setIsLoading(false);
+      } else {
+        updateTrainingLog("❌ 로그 스트리밍 연결 오류");
+        // 오류 발생 시에만 연결 종료
+        eventSource.close();
+        setIsLoading(false);
+      }
     };
 
     return eventSource;
@@ -264,30 +325,20 @@ export default function FedHybridIntegration({
       const data = await response.json();
 
       if (data.success) {
-        setTrainingStatus("로컬 학습이 완료되었습니다!");
-        updateTrainingLog("🎉 로컬 학습 완료! 예측 결과가 생성되었습니다.");
-
-        // 학습 로그 추가
-        if (data.output) {
-          const logs = data.output
-            .split("\n")
-            .filter((log: string) => log.trim());
-          logs.forEach((log: string) => updateTrainingLog(log));
-        }
-
-        updateTrainingLog("📊 AI 학습 결과 컴포넌트에서 결과를 확인하세요.");
-
-        // 학습 완료 이벤트 발생 (ExcelResultViewer 새로고침 트리거)
-        const trainingCompleteEvent = new CustomEvent("training-complete", {
-          detail: { timestamp: new Date().toISOString() },
-        });
-        window.dispatchEvent(trainingCompleteEvent);
+        // 학습이 시작되었음을 표시 (완료가 아님!)
+        setTrainingStatus("로컬 학습 진행 중... (실시간 로그를 확인하세요)");
+        updateTrainingLog("✅ 학습 프로세스가 시작되었습니다 (PID: " + (data.processId || 'N/A') + ")");
+        updateTrainingLog("📊 실시간 로그를 확인하여 학습 진행 상황을 모니터링하세요.");
+        updateTrainingLog("⏳ 학습이 완료되면 예측 결과 파일이 생성됩니다.");
+        
+        // 학습 완료는 로그 스트리밍에서 확인 (Python 프로세스 종료 시)
+        // 학습 완료 이벤트는 여기서 발생시키지 않음!
       } else {
-        throw new Error(data.error || "학습이 실패했습니다.");
+        throw new Error(data.error || "학습을 시작할 수 없습니다.");
       }
 
-      // 서버 상태 다시 확인
-      setTimeout(checkServerStatus, 2000);
+      // 서버 상태 다시 확인 (학습 완료 후)
+      // 학습이 완료될 때까지 기다리지 않고, 로그 스트리밍에서 완료를 감지
     } catch (err) {
       setError(
         err instanceof Error ? err.message : "알 수 없는 오류가 발생했습니다."
@@ -298,14 +349,15 @@ export default function FedHybridIntegration({
         }`
       );
       setTrainingStatus("학습 중 오류가 발생했습니다.");
-    } finally {
-      // 로그 스트리밍 종료
+      
+      // 오류 발생 시 로그 스트리밍 종료
       if (eventSource) {
         eventSource.close();
         updateTrainingLog("🔄 실시간 로그 스트리밍 종료");
       }
       setIsLoading(false);
     }
+    // finally 블록 제거: 로그 스트리밍은 학습이 완료될 때까지 유지
   };
 
   // 예측 결과 다운로드
@@ -585,22 +637,28 @@ export default function FedHybridIntegration({
               <StatItem>
                 <StatLabel>최고 정확도</StatLabel>
                 <StatValue color="#16a34a">
-                  {Math.max(...accuracyData.map((d) => d.accuracy)).toFixed(2)}%
+                  {accuracyData.length > 0
+                    ? Math.max(...accuracyData.map((d) => d.accuracy)).toFixed(2)
+                    : "0.00"}%
                 </StatValue>
               </StatItem>
               <StatItem>
                 <StatLabel>최저 정확도</StatLabel>
                 <StatValue color="#dc2626">
-                  {Math.min(...accuracyData.map((d) => d.accuracy)).toFixed(2)}%
+                  {accuracyData.length > 0
+                    ? Math.min(...accuracyData.map((d) => d.accuracy)).toFixed(2)
+                    : "0.00"}%
                 </StatValue>
               </StatItem>
               <StatItem>
                 <StatLabel>평균 정확도</StatLabel>
                 <StatValue color="#2563eb">
-                  {(
-                    accuracyData.reduce((sum, d) => sum + d.accuracy, 0) /
-                    accuracyData.length
-                  ).toFixed(2)}
+                  {accuracyData.length > 0
+                    ? (
+                        accuracyData.reduce((sum, d) => sum + d.accuracy, 0) /
+                        accuracyData.length
+                      ).toFixed(2)
+                    : "0.00"}
                   %
                 </StatValue>
               </StatItem>
