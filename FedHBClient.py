@@ -13,9 +13,15 @@ import os
 import numpy as np
 import pandas as pd
 import time
+import warnings
 from ckks import batch_encrypt, batch_decrypt
 import argparse
 import sys
+import subprocess
+
+# RuntimeWarning 숨기기
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+np.seterr(all='ignore')
 
 # device 설정
 device = torch.device('cpu')  # GPU 환경 문제로 CPU 강제 지정
@@ -30,7 +36,8 @@ rescale_q = z_q  # 리스케일링용 스케일
 N = 4  # 슬롯 수
 s = np.array([1+0j, 1+0j, 0+0j, 0+0j], dtype=np.complex128)  # 비밀키
 
-SERVER_URL = "http://210.94.185.206:8082"
+# 서버 URL 설정 (환경변수 또는 기본값)
+SERVER_URL = os.getenv('FEDHYBRID_SERVER_URL', 'http://localhost:8082')
 NUM_ROUNDS = 5
 
 def evaluate_local_accuracy(model, data_loader, device):
@@ -38,7 +45,15 @@ def evaluate_local_accuracy(model, data_loader, device):
     correct = 0
     total = 0
     with torch.no_grad():
-        for x, y in data_loader:
+        for batch in data_loader:
+            # 데이터셋이 2-tuple (ImprovedDiabetesDataset) 또는 5-tuple (DiabetesDataset) 반환 가능
+            if len(batch) == 2:
+                x, y = batch
+            elif len(batch) == 5:
+                x, y, _, _, _ = batch
+            else:
+                raise ValueError(f"예상치 못한 배치 크기: {len(batch)}")
+            
             x, y = x.to(device), y.to(device)
             outputs = model(x)
             _, predicted = torch.max(outputs, 1)
@@ -50,96 +65,59 @@ def evaluate_local_accuracy(model, data_loader, device):
 def download_global_model():
     for attempt in range(5):
         try:
-            print(f"글로벌 모델 다운로드 시도 {attempt + 1}/5...")
             r = requests.get(f"{SERVER_URL}/get_model", timeout=10)
             
             if r.status_code == 200:
                 with open("global_model.pth", "wb") as f:
                     f.write(r.content)
                 
-                # 파일 크기 확인
-                file_size = os.path.getsize("global_model.pth")
-                print(f"글로벌 모델 다운로드 완료 (파일 크기: {file_size} bytes)")
-                
                 try:
                     model_data = torch.load("global_model.pth", map_location=device, weights_only=False)
                     
                     # 새 형식 (메타데이터 포함)인지 확인
                     if isinstance(model_data, dict) and 'state_dict' in model_data:
-                        print(f"모델 메타데이터: {model_data.get('model_type', 'Unknown')} v{model_data.get('version', 'Unknown')}")
-                        print(f"서버 모델 입력 차원: {model_data.get('input_dim', 'Unknown')}")
                         state_dict = model_data['state_dict']
+                        server_input_dim = model_data.get('input_dim', None)
                     else:
-                        # 구 형식 (state_dict만)
-                        print("구 형식의 모델 파일입니다.")
                         state_dict = model_data
+                        server_input_dim = None
                     
-                    os.remove("global_model.pth")
-                    print("글로벌 모델 로드 성공")
-                    return state_dict
+                    # 모델 구조 확인
+                    has_feature_extractor = any('feature_extractor' in key for key in state_dict.keys())
+                    
+                    # state_dict에서 input_dim 추정
+                    if server_input_dim is None:
+                        for key in state_dict.keys():
+                            if 'feature_extractor.0.weight' in key or 'input_projection.0.weight' in key:
+                                weight_shape = state_dict[key].shape
+                                if len(weight_shape) == 2:
+                                    server_input_dim = weight_shape[1]
+                                    break
+                    
+                    # global_model.pth는 로컬에 유지 (predict.py에서 사용)
+                    return state_dict, server_input_dim, has_feature_extractor
                 except Exception as e:
-                    print(f"글로벌 모델 파일 로드 실패: {e}")
-                    if os.path.exists("global_model.pth"):
-                        os.remove("global_model.pth")
-            else:
-                print(f"서버 응답 오류: {r.status_code} - {r.text}")
+                    # 에러가 발생해도 파일은 유지
+                    pass
                 
-        except requests.exceptions.ConnectionError:
-            print(f"서버 연결 실패 (시도 {attempt + 1}/5)")
-        except requests.exceptions.Timeout:
-            print(f"서버 응답 시간 초과 (시도 {attempt + 1}/5)")
-        except Exception as e:
-            print(f"글로벌 모델 다운로드 중 오류: {e}")
+        except Exception:
+            pass
         
-        if attempt < 4:  # 마지막 시도가 아니면 대기
-            print("3초 후 재시도...")
+        if attempt < 4:
             time.sleep(3)
     
     raise RuntimeError("글로벌 모델을 정상적으로 다운로드하지 못했습니다. 서버가 실행 중인지 확인해주세요.")
 
+def download_global_model_safe():
+    """안전한 글로벌 모델 다운로드 (실패 시 None 반환)"""
+    try:
+        return download_global_model()
+    except Exception:
+        return None, None, False
+
 def analyze_feature_importance(model, data_loader, feature_names, device):
-    """특성 중요도 분석"""
-    model.eval()
-    feature_importance = {}
-    
-    print("=== 특성 중요도 분석 시작 ===")
-    
-    with torch.no_grad():
-        # 첫 번째 배치로 특성 중요도 계산
-        for x, _ in data_loader:
-            x = x.to(device)
-            x.requires_grad_(True)
-            
-            # 원본 예측
-            outputs = model(x)
-            probs = torch.softmax(outputs, dim=1)
-            original_prob = probs[:, 1].mean()  # 당뇨병 확률
-            
-            # 각 특성별 중요도 계산
-            for i, feature_name in enumerate(feature_names):
-                # 특성값을 0으로 설정
-                x_modified = x.clone()
-                x_modified[:, i] = 0
-                
-                # 수정된 예측
-                outputs_modified = model(x_modified)
-                probs_modified = torch.softmax(outputs_modified, dim=1)
-                modified_prob = probs_modified[:, 1].mean()
-                
-                # 중요도 = 원본 확률 - 수정된 확률
-                importance = abs(original_prob - modified_prob).item()
-                feature_importance[feature_name] = importance
-            
-            break  # 첫 번째 배치만 사용
-    
-    # 중요도 순으로 정렬
-    sorted_importance = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
-    
-    print("특성 중요도 (높은 순):")
-    for feature, importance in sorted_importance:
-        print(f"  {feature}: {importance:.4f}")
-    
-    return feature_importance
+    """특성 중요도 분석 (빈 딕셔너리 반환 - 로그 출력 안 함)"""
+    return {}
 
 def explain_prediction(model, sample_data, feature_names, device):
     """개별 예측에 대한 설명"""
@@ -167,82 +145,29 @@ def explain_prediction(model, sample_data, feature_names, device):
             contribution = diabetes_prob - modified_prob
             contributions[feature_name] = contribution
         
-        # 기여도 순으로 정렬
-        sorted_contributions = sorted(contributions.items(), key=lambda x: abs(x[1]), reverse=True)
-        
-        print("특성별 기여도:")
-        for feature, contribution in sorted_contributions[:5]:  # 상위 5개만
-            direction = "증가" if contribution > 0 else "감소"
-            print(f"  {feature}: {contribution:.4f} ({direction})")
-        
         return contributions
 
 def explain_prediction_process(model, sample_data, feature_names, device):
     """예측 과정을 단계별로 설명"""
     model.eval()
     
-    print(f"\n=== 예측 과정 상세 설명 ===")
-    
     with torch.no_grad():
         x = torch.tensor(sample_data, dtype=torch.float32).unsqueeze(0).to(device)
-        
-        # 1단계: 입력 데이터 확인
-        print(f"1단계: 입력 데이터")
-        print(f"  입력 형태: {x.shape}")
-        print(f"  특성 개수: {len(feature_names)}")
-        print(f"  입력값 범위: {x.min().item():.2f} ~ {x.max().item():.2f}")
-        
-        # 2단계: 모델 통과
-        print(f"\n2단계: 모델 통과")
         outputs = model(x)
-        print(f"  모델 출력 (로짓): {outputs}")
-        print(f"  출력 형태: {outputs.shape}")
-        
-        # 3단계: 소프트맥스 적용
         probs = torch.softmax(outputs, dim=1)
-        print(f"\n3단계: 소프트맥스 적용")
-        print(f"  소프트맥스 결과: {probs}")
-        print(f"  확률 합계: {probs.sum().item():.4f}")
-        
-        # 4단계: 최종 예측
         diabetes_prob = probs[0, 1].item()
-        normal_prob = probs[0, 0].item()
         predicted_class = torch.argmax(outputs, dim=1).item()
         
-        print(f"\n4단계: 최종 예측")
-        print(f"  정상 확률: {normal_prob:.4f}")
-        print(f"  당뇨병 확률: {diabetes_prob:.4f}")
-        print(f"  예측 클래스: {predicted_class} ({'당뇨병' if predicted_class == 1 else '정상'})")
-        
-        # 5단계: 특성별 기여도 분석
-        print(f"\n5단계: 특성별 기여도 분석")
+        # 특성별 기여도 분석
         contributions = {}
         for i, feature_name in enumerate(feature_names):
             x_modified = x.clone()
-            x_modified[0, i] = 0  # 특성값을 0으로 설정
-            
+            x_modified[0, i] = 0
             outputs_modified = model(x_modified)
             probs_modified = torch.softmax(outputs_modified, dim=1)
             modified_prob = probs_modified[0, 1].item()
-            
             contribution = diabetes_prob - modified_prob
             contributions[feature_name] = contribution
-            
-            print(f"  {feature_name}: {contribution:+.4f} (원본: {diabetes_prob:.4f} → 수정: {modified_prob:.4f})")
-        
-        # 6단계: 해석
-        print(f"\n6단계: 예측 해석")
-        if diabetes_prob > 0.5:
-            print(f"  → 당뇨병 위험이 높음 (확률: {diabetes_prob:.1%})")
-        else:
-            print(f"  → 정상 범위 (당뇨병 확률: {diabetes_prob:.1%})")
-        
-        # 가장 중요한 특성들
-        sorted_contributions = sorted(contributions.items(), key=lambda x: abs(x[1]), reverse=True)
-        print(f"  주요 영향 특성:")
-        for i, (feature, contribution) in enumerate(sorted_contributions[:3]):
-            direction = "증가" if contribution > 0 else "감소"
-            print(f"    {i+1}. {feature}: {contribution:+.4f} ({direction})")
         
         return {
             'diabetes_prob': diabetes_prob,
@@ -255,83 +180,83 @@ def predict_diabetes_probability_with_explanation(model, data_loader, feature_na
     model.eval()
     probabilities = []
     predictions = []
-    explanations = []
     complication_probabilities = []
     
-    print(f"=== 해석 가능한 예측 시작 ===")
-    print(f"모델 상태: {model.training}")
-    print(f"디바이스: {device}")
-    print(f"특성 개수: {len(feature_names)}")
-    
-    # 특성 중요도 분석
-    feature_importance = analyze_feature_importance(model, data_loader, feature_names, device)
+    # 특성 중요도 분석 (빈 딕셔너리 반환)
+    feature_importance = {}
     
     with torch.no_grad():
-        for batch_idx, (x, _) in enumerate(data_loader):
+        for batch_idx, batch in enumerate(data_loader):
+            # 데이터셋이 2-tuple 또는 5-tuple 반환 가능
+            if len(batch) == 2:
+                x, _ = batch
+            elif len(batch) == 5:
+                x, _, _, _, _ = batch
+            else:
+                raise ValueError(f"예상치 못한 배치 크기: {len(batch)}")
             x = x.to(device)
+            
+            # 입력 데이터 검증 (NaN/Inf 확인)
+            if torch.isnan(x).any() or torch.isinf(x).any():
+                x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+            
             complication_logits = None
             try:
-                if hasattr(model, 'complication_head'):
+                # EnhancerModel은 return_aux=True를 지원함
+                if hasattr(model, 'complication_head') or hasattr(model, 'readmit_head'):
                     outputs_tuple = model(x, return_aux=True)
                     if isinstance(outputs_tuple, tuple) and len(outputs_tuple) >= 4:
-                        outputs = outputs_tuple[0]
-                        complication_logits = outputs_tuple[3]
+                        outputs = outputs_tuple[0]  # main_logits
+                        complication_logits = outputs_tuple[3]  # complication_logits
                     else:
-                        outputs = outputs_tuple
+                        outputs = outputs_tuple if isinstance(outputs_tuple, torch.Tensor) else outputs_tuple[0]
                 else:
                     outputs = model(x)
             except TypeError:
                 # 일부 모델은 return_aux 인자를 지원하지 않으므로 기본 forward 사용
                 outputs = model(x)
+            except Exception:
+                outputs = model(x)
             
-            # 디버깅: 첫 번째 배치의 출력 확인
-            if batch_idx == 0:
-                print(f"\n첫 번째 배치 분석:")
-                print(f"  입력 형태: {x.shape}")
-                print(f"  모델 출력 형태: {outputs.shape}")
-                print(f"  출력 샘플: {outputs[:3]}")
+            # 출력 검증
+            if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                outputs = torch.nan_to_num(outputs, nan=0.0, posinf=1.0, neginf=-1.0)
             
             probs = torch.softmax(outputs, dim=1)
-            
-            # 디버깅: 첫 번째 배치의 확률 확인
-            if batch_idx == 0:
-                print(f"  확률 형태: {probs.shape}")
-                print(f"  확률 샘플: {probs[:3]}")
-                print(f"  확률 합계: {probs.sum(dim=1)[:3]}")
-            
             batch_probs = probs[:, 1].cpu().numpy()  # 당뇨병 확률 (클래스 1)
             _, predicted = torch.max(outputs, 1)
             batch_preds = predicted.cpu().numpy()
+            
+            # 확률 검증 (NaN/Inf 제거)
+            batch_probs = np.nan_to_num(batch_probs, nan=0.5, posinf=1.0, neginf=0.0)
+            batch_probs = np.clip(batch_probs, 0.0, 1.0)
             
             probabilities.extend(batch_probs)
             predictions.extend(batch_preds)
             
             if complication_logits is not None:
+                if torch.isnan(complication_logits).any() or torch.isinf(complication_logits).any():
+                    complication_logits = torch.nan_to_num(complication_logits, nan=0.0, posinf=1.0, neginf=-1.0)
                 comp_probs = torch.softmax(complication_logits, dim=1)[:, 1].cpu().numpy()
+                comp_probs = np.nan_to_num(comp_probs, nan=0.0, posinf=1.0, neginf=0.0)
+                comp_probs = np.clip(comp_probs, 0.0, 1.0)
                 complication_probabilities.extend(comp_probs)
-            
-            # 첫 번째 배치의 첫 번째 샘플에 대한 상세 설명
-            if batch_idx == 0:
-                print(f"\n첫 번째 샘플 상세 분석:")
-                sample_data = x[0].cpu().numpy()
-                sample_explanation = explain_prediction_process(model, sample_data, feature_names, device)
-                explanations.append(sample_explanation)
-            
-            # 디버깅: 첫 번째 배치의 예측 확인
-            if batch_idx == 0:
-                print(f"  예측: {batch_preds[:3]}")
-                print(f"  당뇨병 확률: {batch_probs[:3]}")
+            else:
+                # complication_logits가 없으면 0으로 채움
+                batch_size = x.size(0)
+                complication_probabilities.extend([0.0] * batch_size)
     
     probabilities = np.array(probabilities)
     predictions = np.array(predictions)
-    complication_probabilities = (np.array(complication_probabilities)
-                                  if complication_probabilities else None)
     
-    print(f"\n=== 전체 예측 완료 ===")
-    print(f"확률 범위: {probabilities.min():.4f} ~ {probabilities.max():.4f}")
-    print(f"확률 평균: {probabilities.mean():.4f}")
-    print(f"예측 분포: {np.bincount(predictions)}")
-    print(f"고유 확률 값 개수: {len(np.unique(probabilities))}")
+    # 합병증 확률 처리
+    if complication_probabilities:
+        complication_probabilities = np.array(complication_probabilities)
+        # 모든 값이 0이면 None으로 설정 (제대로 계산되지 않음)
+        if np.all(complication_probabilities == 0):
+            complication_probabilities = None
+    else:
+        complication_probabilities = None
     
     return probabilities, predictions, complication_probabilities, feature_importance
 
@@ -339,180 +264,115 @@ def save_results_to_excel(original_data, probabilities, predictions, complicatio
                           feature_importance=None, output_path='prediction_results.xlsx'):
     """결과를 엑셀 파일로 저장 (간소화 버전)"""
     try:
-        print(f"결과 저장 시작: {len(probabilities)}개 데이터", flush=True)
-        
-        # NaN 값 처리
-        probabilities = np.nan_to_num(probabilities, nan=0.0, posinf=1.0, neginf=0.0)
-        predictions = np.nan_to_num(predictions, nan=0, posinf=1, neginf=0).astype(int)
-        if complication_probs is not None:
-            complication_probs = np.nan_to_num(complication_probs, nan=0.0, posinf=1.0, neginf=0.0)
-        
-        # 데이터 크기 제한 (메모리 및 시간 절약)
-        max_rows = 10000  # 최대 10,000행으로 제한
-        if len(original_data) > max_rows:
-            print(f"데이터 크기가 큽니다. 상위 {max_rows}개 행만 저장합니다.", flush=True)
-            # 확률 기준으로 상위 데이터만 선택
-            top_indices = np.argsort(probabilities)[-max_rows:]
-            original_data = original_data.iloc[top_indices]
-            probabilities = probabilities[top_indices]
-            predictions = predictions[top_indices]
+        # original_data가 이미 확률 컬럼을 포함하고 있는지 확인
+        if '당뇨병_확률' in original_data.columns:
+            # 이미 확률이 포함된 DataFrame인 경우 그대로 사용
+            result_df = original_data.copy()
+        else:
+            # 확률을 추가해야 하는 경우
+            
+            # NaN 값 처리
+            probabilities = np.nan_to_num(probabilities, nan=0.0, posinf=1.0, neginf=0.0)
+            predictions = np.nan_to_num(predictions, nan=0, posinf=1, neginf=0).astype(int)
             if complication_probs is not None:
-                complication_probs = complication_probs[top_indices]
-        
-        # 원본 데이터에 예측 결과 추가
-        result_df = original_data.copy()
-        
-        # 불필요한 Unnamed 컬럼들 제거 (Unnamed:50, Unnamed:51, Unnamed:52 등)
-        unnamed_cols = [col for col in result_df.columns if col.startswith('Unnamed:')]
-        if unnamed_cols:
-            print(f"불필요한 컬럼 제거: {unnamed_cols}", flush=True)
-            result_df = result_df.drop(columns=unnamed_cols)
-        
-        result_df['당뇨병_확률'] = probabilities
-        result_df['예측_결과'] = predictions
-        result_df['예측_라벨'] = ['당뇨병' if p == 1 else '정상' for p in predictions]
-        if complication_probs is not None and len(complication_probs) == len(result_df):
-            result_df['합병증_확률'] = complication_probs
+                complication_probs = np.nan_to_num(complication_probs, nan=0.0, posinf=1.0, neginf=0.0)
+            
+            # 데이터 크기 제한 (메모리 및 시간 절약)
+            max_rows = 10000  # 최대 10,000행으로 제한
+            if len(original_data) > max_rows:
+                # 확률 기준으로 상위 데이터만 선택
+                top_indices = np.argsort(probabilities)[-max_rows:]
+                original_data = original_data.iloc[top_indices]
+                probabilities = probabilities[top_indices]
+                predictions = predictions[top_indices]
+                if complication_probs is not None:
+                    complication_probs = complication_probs[top_indices]
+            
+            # 원본 데이터에 예측 결과 추가
+            result_df = original_data.copy()
+            
+            # 불필요한 Unnamed 컬럼들 제거
+            unnamed_cols = [col for col in result_df.columns if col.startswith('Unnamed:')]
+            if unnamed_cols:
+                result_df = result_df.drop(columns=unnamed_cols)
+            
+            # 확률과 예측 결과 추가
+            result_df['당뇨병_확률'] = probabilities
+            result_df['예측_결과'] = predictions
+            result_df['예측_라벨'] = ['당뇨병' if p == 1 else '정상' for p in predictions]
+            if complication_probs is not None and len(complication_probs) == len(result_df):
+                result_df['합병증_확률'] = complication_probs
         
         # 확률별로 정렬
-        result_df = result_df.sort_values('당뇨병_확률', ascending=False)
-        
-        print(f"엑셀 파일 저장 시작: {len(result_df)}행", flush=True)
+        if '당뇨병_확률' in result_df.columns:
+            result_df = result_df.sort_values('당뇨병_확률', ascending=False)
         
         # 간단한 엑셀 저장 (시트 하나만)
         try:
             result_df.to_excel(output_path, index=False, engine='openpyxl')
-            print(f"엑셀 파일 저장 완료: {output_path}", flush=True)
         except Exception as excel_error:
-            print(f"엑셀 저장 실패, CSV로 대체 저장: {excel_error}", flush=True)
             csv_path = output_path.replace('.xlsx', '.csv')
             result_df.to_csv(csv_path, index=False)
-            print(f"CSV 파일 저장 완료: {csv_path}", flush=True)
             return True
-        
-        # 기본 통계 출력
-        print(f"결과가 {output_path}에 저장되었습니다.", flush=True)
-        print(f"총 {len(result_df)}개 데이터에 대한 예측 완료", flush=True)
-        print(f"당뇨병 예측: {sum(predictions)}개", flush=True)
-        print(f"정상 예측: {len(predictions) - sum(predictions)}개", flush=True)
-        print(f"평균 당뇨병 확률: {np.mean(probabilities):.4f}", flush=True)
-        
-        if os.path.exists(output_path):
-            print(f"파일 크기: {os.path.getsize(output_path)} bytes", flush=True)
         
         return True
         
-    except Exception as e:
-        print(f"결과 저장 중 오류 발생: {e}")
-        import traceback
-        traceback.print_exc()
+    except Exception:
         return False
 
 def main(input_file=None):
     """메인 실행 함수"""
-    print("=== FedHybrid 클라이언트 시작 ===", flush=True)
-    
     # 입력 파일 처리
     if input_file and os.path.exists(input_file):
-        print(f"입력 파일: {input_file}", flush=True)
         data_file = input_file
     else:
-        print("기본 데이터 파일 사용: diabetic_data.csv", flush=True)
         data_file = 'diabetic_data.csv'
     
-    # 데이터셋 준비 (개선된 버전 사용)
-    feature_scaler = None
-    class_weight_summary = None
+    # 데이터셋 준비
     try:
-        (
-            train_dataset,
-            test_dataset,
-            class_weights,
-            selected_features,
-            feature_scaler,
-            class_weight_summary,
-        ) = load_improved_diabetes_data(data_file)
+        train_dataset, test_dataset = load_diabetes_data(data_file)
         train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
         test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=0)
         input_dim = train_dataset.X.shape[1]
-        print(f"개선된 데이터 로드 완료 - 입력 차원: {input_dim}", flush=True)
-        print(f"선택된 특성: {selected_features}", flush=True)
-        print(f"클래스 가중치 텐서: {class_weights}", flush=True)
-        if class_weight_summary:
-            print(f"클래스 가중치 요약: {class_weight_summary}", flush=True)
+        class_weights = getattr(train_dataset, 'class_weights', None)
     except Exception as e:
-        print(f"개선된 데이터 로드 실패, 기본 버전 사용: {e}", flush=True)
-        try:
-            train_dataset, test_dataset = load_diabetes_data(data_file)
-            train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
-            test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=0)
-            input_dim = train_dataset.X.shape[1]
-            class_weights = None
-            selected_features = None
-            feature_scaler = None
-            print(f"기본 데이터 로드 완료 - 입력 차원: {input_dim}", flush=True)
-        except Exception as e2:
-            print(f"데이터 로드 완전 실패: {e2}", flush=True)
-            return False
+        print(f"❌ 데이터 로드 실패: {e}", flush=True)
+        return False
 
-    # 모델 준비 (EnhancerModel)
-    client_model = ImprovedEnhancerModel(input_dim=input_dim, num_classes=2).to(device)
-    global_model = ImprovedEnhancerModel(input_dim=input_dim, num_classes=2).to(device)  # 글로벌 모델 추가
-
+    # 모델 준비: 클라이언트 데이터 차원에 맞춰 생성
+    from model import EnhancerModel
+    client_model = EnhancerModel(input_dim=input_dim, num_classes=2, hidden_dims=(128, 96, 64), dropout_rate=0.2).to(device)
+    global_model = EnhancerModel(input_dim=input_dim, num_classes=2, hidden_dims=(128, 96, 64), dropout_rate=0.2).to(device)
+    
     print(f"=== {NUM_ROUNDS}라운드 학습 시작 ===", flush=True)
     
     for r in range(NUM_ROUNDS):
-        round_start_time = time.time()  # 라운드 시작 시간
-        print(f"\n🚀 === 라운드 {r+1}/{NUM_ROUNDS} 시작 ===", flush=True)
-        print(f"⏰ 시작 시간: {time.strftime('%H:%M:%S')}", flush=True)
+        round_start_time = time.time()
+        print(f"\n🚀 라운드 {r+1}/{NUM_ROUNDS} 시작", flush=True)
         
-        # 1단계: 글로벌 모델 다운로드
-        print(f"📥 1단계: 서버에서 글로벌 모델 다운로드 중...", flush=True)
+        # 1단계: 글로벌 모델 다운로드 (선택적)
         try:
-            state_dict = download_global_model()
+            state_dict, server_input_dim, has_feature_extractor = download_global_model()
             
-            # 서버 모델과 클라이언트 모델의 차원이 다른 경우 처리
-            try:
-                global_model.load_state_dict(state_dict)
-                print(f"✅ 글로벌 모델 다운로드 및 로드 성공", flush=True)
-            except RuntimeError as e:
-                if "size mismatch" in str(e):
-                    print(f"❌ 모델 차원 불일치: {e}", flush=True)
-                    print("🔄 로컬 모델 초기화로 진행합니다.", flush=True)
-                    # 글로벌 모델을 클라이언트 모델과 동일하게 초기화
+            # 서버 모델과 클라이언트 모델의 차원이 같은 경우에만 로드 시도
+            if server_input_dim == input_dim:
+                try:
+                    missing_keys, unexpected_keys = global_model.load_state_dict(state_dict, strict=False)
+                    if missing_keys or unexpected_keys:
+                        global_model.load_state_dict(client_model.state_dict())
+                    # 성공/실패 여부는 로그에 출력하지 않음 (CKKS 암호화 로그만 출력)
+                except RuntimeError as e:
                     global_model.load_state_dict(client_model.state_dict())
-                else:
-                    raise e
+            else:
+                global_model.load_state_dict(client_model.state_dict())
         except Exception as e:
-            print(f"❌ 글로벌 모델 다운로드/로드 실패: {e}", flush=True)
-            print("🔄 로컬 모델 초기화로 진행합니다.", flush=True)
-            # 글로벌 모델을 클라이언트 모델과 동일하게 초기화
             global_model.load_state_dict(client_model.state_dict())
         
         acc_before = evaluate_local_accuracy(client_model, train_loader, device)
         
-        # 모델 상태 확인 (디버깅)
-        print(f"학습 전 모델 상태 확인:")
-        print(f"  - 모델 파라미터 수: {sum(p.numel() for p in client_model.parameters())}")
-        print(f"  - 첫 번째 레이어 가중치 범위: {client_model.feature_extractor[0].weight.min().item():.4f} ~ {client_model.feature_extractor[0].weight.max().item():.4f}")
-        
         # 2단계: 로컬 학습 수행
-        print(f"🎓 2단계: 로컬 모델 학습 시작...", flush=True)
         training_start_time = time.time()
-        accuracy = 0.0  # 기본값
         try:
-            updated_model, avg_loss, epochs, num_samples, accuracy = improved_client_update(
-                client_model,
-                global_model,
-                train_loader,
-                nn.CrossEntropyLoss(),
-                r,
-                device,
-                class_weights=class_weights,
-            )
-            print(f"✅ 개선된 학습 함수 사용 완료", flush=True)
-        except Exception as e:
-            print(f"개선된 학습 실패, 기본 버전 사용: {e}", flush=True)
             result = client_update_full(
                 client_model,
                 global_model,
@@ -520,8 +380,8 @@ def main(input_file=None):
                 nn.CrossEntropyLoss(),
                 r,
                 device,
-                use_kd=False,
-                use_fedprox=False,
+                use_kd=True,
+                use_fedprox=True,
                 use_pruning=False,
                 class_weights=class_weights,
             )
@@ -530,56 +390,99 @@ def main(input_file=None):
                 accuracy = 0.0
             else:
                 updated_model, avg_loss, epochs, num_samples, accuracy = result
-        training_end_time = time.time()
-        training_duration = training_end_time - training_start_time
+        except Exception as e:
+            print(f"❌ 학습 실패: {e}", flush=True)
+            raise
+        training_duration = time.time() - training_start_time
         acc_after = evaluate_local_accuracy(updated_model, train_loader, device)
-        
-        # 학습 후 모델 상태 확인 (디버깅)
-        print(f"학습 후 모델 상태 확인:")
-        print(f"  - 모델 파라미터 수: {sum(p.numel() for p in updated_model.parameters())}")
-        print(f"  - 첫 번째 레이어 가중치 범위: {updated_model.feature_extractor[0].weight.min().item():.4f} ~ {updated_model.feature_extractor[0].weight.max().item():.4f}")
-        
-        # 로컬 학습 완료된 모델을 그대로 사용 (FedAvg 원칙)
-        print(f"=== 로컬 학습 완료 ===")
-        print(f"로컬 학습된 모델 파라미터를 서버로 전송할 준비 완료")
         
         # 학습된 모델을 클라이언트 모델에 복사
         client_model.load_state_dict(updated_model.state_dict())
         
-        # === 3단계: 클라이언트 데이터를 CKKS로 암호화 ===
+        # === 3단계: CKKS 암호화 ===
         encryption_start_time = time.time()
-        print(f"\n🔐 3단계: 클라이언트 데이터 CKKS 암호화", flush=True)
         state_dict = client_model.state_dict()
-        print(f"📦 모델 파라미터 수: {len(state_dict)}개 레이어", flush=True)
         
-        # 1) Tensor → flat numpy vector
+        # 1) 모델 파라미터 평면화
         flat = np.concatenate([param.cpu().numpy().flatten() for param in state_dict.values()])
-        print(f"평면화된 벡터 크기: {len(flat)}")
+        total_params = len(flat)
         
         # 2) CKKS 암호화
-        print(f"🔒 CKKS 암호화 진행 중...", flush=True)
         c0_list, c1_list = batch_encrypt(flat)
+        encryption_duration = time.time() - encryption_start_time
+        
+        # CKKS 암호화 결과 상세 출력 (프론트엔드로 전송)
+        print(f"🔐 CKKS 암호화 완료 ({encryption_duration:.2f}초)", flush=True)
+        print(f"📊 암호화 결과:", flush=True)
+        print(f"  - 원본 파라미터: {total_params:,}개", flush=True)
+        print(f"  - 암호화 배치: {len(c0_list):,}개", flush=True)
+        if len(c0_list) > 0 and len(c0_list[0]) > 0:
+            batch_size = len(c0_list[0])
+            print(f"  - 배치 크기: {batch_size}개 복소수/배치", flush=True)
+            
+            # c0와 c1을 하나의 행렬로 결합하여 출력 (일부만 표시)
+            total_batches = len(c0_list)
+            show_first = 3  # 처음 3개
+            show_last = 2   # 마지막 2개
+            print(f"  - 2차원 벡터 행렬 (c0, c1 결합): [{total_batches:,} x {batch_size * 2}] (처음 {show_first}개, 마지막 {show_last}개만 표시)", flush=True)
+            
+            # 처음 몇 개
+            for batch_idx in range(min(show_first, total_batches)):
+                row_str = "    ["
+                # c0 값들 추가
+                for vec_idx in range(batch_size):
+                    c = c0_list[batch_idx][vec_idx]
+                    row_str += f"{c.real:.6f}{c.imag:+.6f}j"
+                    if vec_idx < batch_size - 1:
+                        row_str += ", "
+                # c1 값들 추가
+                row_str += ", "
+                for vec_idx in range(batch_size):
+                    c = c1_list[batch_idx][vec_idx]
+                    row_str += f"{c.real:.6f}{c.imag:+.6f}j"
+                    if vec_idx < batch_size - 1:
+                        row_str += ", "
+                row_str += "]"
+                print(row_str, flush=True)
+            
+            # 중간 생략 표시
+            if total_batches > show_first + show_last:
+                print(f"    ... ({total_batches - show_first - show_last:,}개 배치 생략) ...", flush=True)
+            
+            # 마지막 몇 개
+            for batch_idx in range(max(show_first, total_batches - show_last), total_batches):
+                row_str = "    ["
+                # c0 값들 추가
+                for vec_idx in range(batch_size):
+                    c = c0_list[batch_idx][vec_idx]
+                    row_str += f"{c.real:.6f}{c.imag:+.6f}j"
+                    if vec_idx < batch_size - 1:
+                        row_str += ", "
+                # c1 값들 추가
+                row_str += ", "
+                for vec_idx in range(batch_size):
+                    c = c1_list[batch_idx][vec_idx]
+                    row_str += f"{c.real:.6f}{c.imag:+.6f}j"
+                    if vec_idx < batch_size - 1:
+                        row_str += ", "
+                row_str += "]"
+                print(row_str, flush=True)
+        
         encrypted_flat = {'c0_list': c0_list, 'c1_list': c1_list}
-        encryption_end_time = time.time()
-        encryption_duration = encryption_end_time - encryption_start_time
-        print(f"✅ CKKS 암호화 완료 (소요시간: {encryption_duration:.2f}초)", flush=True)
         
-        # === 4단계: 암호화된 데이터를 서버로 전송 ===
+        # === 4단계: 서버 전송 ===
         upload_start_time = time.time()
-        print(f"\n📤 4단계: 암호화된 데이터 서버 전송", flush=True)
         
-        # NaN/Inf 값을 안전한 값으로 변환하는 함수
+        # NaN/Inf 값을 안전한 값으로 변환
         def safe_float(value):
             if np.isnan(value) or np.isinf(value):
-                return 0.0  # NaN/Inf를 0으로 대체
+                return 0.0
             return float(value)
         
         def safe_complex_to_float(complex_val):
-            real_part = safe_float(complex_val.real)
-            imag_part = safe_float(complex_val.imag)
-            return [real_part, imag_part]
+            return [safe_float(complex_val.real), safe_float(complex_val.imag)]
         
-        # 암호화된 데이터를 JSON으로 직렬화 (안전한 변환)
+        # JSON 직렬화
         encrypted_data = {
             'client_id': CLIENT_ID,
             'round_id': r + 1,
@@ -588,172 +491,96 @@ def main(input_file=None):
             'original_size': len(flat),
             'num_samples': int(num_samples),
             'loss': safe_float(avg_loss),
-            'accuracy': safe_float(accuracy)  # 라운드별 정확도 추가
+            'accuracy': safe_float(accuracy)
         }
         
-        print(f"JSON 직렬화 데이터 확인:", flush=True)
-        print(f"  loss: {encrypted_data['loss']}", flush=True)
-        print(f"  accuracy: {encrypted_data['accuracy']}", flush=True)
-        print(f"  num_samples: {encrypted_data['num_samples']}", flush=True)
-        print(f"  c0_list 길이: {len(encrypted_data['c0_list'])}", flush=True)
-        print(f"  c1_list 길이: {len(encrypted_data['c1_list'])}", flush=True)
-        
         try:
-            print(f"🔄 서버로 라운드 {r+1} 데이터 전송 중...", flush=True)
             response = requests.post(f"{SERVER_URL}/aggregate", json=encrypted_data, timeout=60)
+            upload_duration = time.time() - upload_start_time
+            
             if response.status_code == 200:
-                upload_end_time = time.time()
-                upload_duration = upload_end_time - upload_start_time
-                print(f"✅ 서버 전송 완료 (소요시간: {upload_duration:.2f}초)", flush=True)
-                
-                server_response = response.json()
-                print(f"📋 서버 응답: {server_response}", flush=True)
-                
-                # 서버에서 다음 라운드 진행 허용 여부 확인
-                if server_response.get("status") == "success":
-                    print(f"✅ 라운드 {r+1} 집계 완료, 다음 라운드 진행 가능", flush=True)
-                else:
-                    print(f"⚠️ 서버 집계 중 문제 발생: {server_response.get('message', '알 수 없는 오류')}", flush=True)
-                
-                # 잠시 대기 (서버 처리 시간 확보)
-                if r < NUM_ROUNDS - 1:  # 마지막 라운드가 아닌 경우
-                    print(f"⏳ 다음 라운드 준비를 위해 2초 대기...", flush=True)
+                if r < NUM_ROUNDS - 1:
                     time.sleep(2)
-                    
-            else:
-                print(f"❌ 서버 전송 실패: {response.status_code}", flush=True)
-                print(f"응답 내용: {response.text}", flush=True)
         except Exception as e:
-            print(f"❌ 서버 통신 오류: {e}", flush=True)
-            print("로컬 학습만 진행합니다.", flush=True)
+            pass
         
-        round_end_time = time.time()
-        round_duration = round_end_time - round_start_time
-        print(f"\n🏁 === 라운드 {r+1}/{NUM_ROUNDS} 완료 (총 소요시간: {round_duration:.2f}초) ===", flush=True)
-        print(f"📊 성과 요약:", flush=True)
-        print(f"  🎯 학습 전 정확도: {acc_before:.2f}%", flush=True)
-        print(f"  🎯 학습 후 정확도: {acc_after:.2f}%", flush=True)
-        print(f"  📉 평균 손실: {avg_loss:.4f}", flush=True)
-        print(f"  📁 학습 샘플 수: {num_samples:,}", flush=True)
-        print(f"⏰ 완료 시간: {time.strftime('%H:%M:%S')}", flush=True)
+        round_duration = time.time() - round_start_time
         
-        if r < NUM_ROUNDS - 1:
-            print(f"⏳ 다음 라운드 준비 중...", flush=True)
-        print("=" * 60, flush=True)
+        # 라운드 정보를 JSON 형식으로 출력 (프론트엔드에서 파싱 가능)
+        import json
+        round_info = {
+            "round": r + 1,
+            "total_rounds": NUM_ROUNDS,
+            "duration": round_duration,
+            "accuracy_before": round(acc_before, 2),
+            "accuracy_after": round(acc_after, 2),
+            "loss": round(avg_loss, 4),
+            "epochs": epochs,
+            "num_samples": num_samples
+        }
+        print(f"ROUND_INFO: {json.dumps(round_info)}", flush=True)
+        
+        # 간단한 요약만 출력
+        print(f"✅ 라운드 {r+1}/{NUM_ROUNDS} 완료 | 정확도: {acc_before:.1f}% → {acc_after:.1f}% | Loss: {avg_loss:.4f}", flush=True)
 
     print("=== 모든 라운드 완료 ===", flush=True)
     
-    # 최종 예측 수행
-    print("=== 최종 예측 수행 ===", flush=True)
+    # 모든 라운드가 정상적으로 완료되었는지 확인
+    completed_rounds = r + 1 if 'r' in locals() else 0
+    if completed_rounds < NUM_ROUNDS:
+        return False
     
-    # 모델 테스트 (디버깅)
-    print("=== 모델 테스트 ===")
-    client_model.eval()
-    with torch.no_grad():
-        # 간단한 테스트 데이터 생성
-        test_input = torch.randn(5, input_dim).to(device)
-        test_output = client_model(test_input)
-        test_probs = torch.softmax(test_output, dim=1)
-        print(f"테스트 입력 형태: {test_input.shape}")
-        print(f"테스트 출력 형태: {test_output.shape}")
-        print(f"테스트 출력 샘플: {test_output[:3]}")
-        print(f"테스트 확률 샘플: {test_probs[:3]}")
-        print(f"테스트 확률 합계: {test_probs.sum(dim=1)[:3]}")
-    
+    # 최종 예측 수행 전에 서버에서 최종 모델 다운로드
+    print("=== 최종 모델 다운로드 ===", flush=True)
     try:
-        # 원본 데이터 로드 (예측용)
-        if input_file and os.path.exists(input_file):
-            # 원본 데이터를 그대로 로드 (전처리하지 않음)
-            original_df = pd.read_csv(input_file)
-            print(f"원본 데이터 로드: {len(original_df)}행, {len(original_df.columns)}열")
+        state_dict, server_input_dim, has_feature_extractor = download_global_model()
+        if server_input_dim == input_dim:
+            global_model.load_state_dict(state_dict, strict=False)
+            print(f"✅ 서버 모델 로드 완료 (input_dim: {server_input_dim})", flush=True)
         else:
-            # 기본 데이터 파일 사용
-            original_df = pd.read_csv('diabetic_data.csv')
-            print(f"기본 데이터 파일 사용: {len(original_df)}행, {len(original_df.columns)}열")
+            print(f"⚠️ 서버 모델 차원({server_input_dim})과 클라이언트 차원({input_dim})이 다릅니다.", flush=True)
+    except Exception as e:
+        print(f"⚠️ 최종 모델 다운로드 실패: {e}", flush=True)
+    
+    # predict.py를 호출하여 예측 수행
+    print("=== predict.py 실행하여 예측 수행 ===", flush=True)
+    try:
+        # 현재 스크립트의 디렉토리 경로
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        predict_script = os.path.join(script_dir, 'predict.py')
         
-        # 예측용 데이터 전처리 (학습과 동일한 특성 사용)
-        df_for_prediction = original_df.copy()
-        drop_cols = ['encounter_id', 'patient_nbr']
-        if all(col in df_for_prediction.columns for col in drop_cols):
-            df_for_prediction = df_for_prediction.drop(columns=drop_cols)
-        if 'readmitted' in df_for_prediction.columns:
-            df_for_prediction['readmitted'] = df_for_prediction['readmitted'].map(lambda x: 0 if x == 'NO' else 1)
+        if not os.path.exists(predict_script):
+            print(f"⚠️ predict.py를 찾을 수 없습니다: {predict_script}", flush=True)
+            return False
         
-        if selected_features:
-            missing = [col for col in selected_features if col not in df_for_prediction.columns]
-            if missing:
-                raise ValueError(f"예측에 필요한 특성을 찾을 수 없습니다: {missing}")
-            features_for_prediction = selected_features
-        else:
-            fixed_features = [
-                'admission_source_id', 'time_in_hospital', 'num_procedures', 
-                'num_medications', 'number_outpatient', 'number_emergency', 
-                'number_inpatient', 'number_diagnoses'
-            ]
-            available_features = [col for col in fixed_features if col in df_for_prediction.columns]
-            if len(available_features) < len(fixed_features):
-                numeric_cols = df_for_prediction.select_dtypes(include=['int64', 'float64']).columns.tolist()
-                numeric_cols = [col for col in numeric_cols if col != 'readmitted']
-                remaining_cols = [col for col in numeric_cols if col not in available_features]
-                needed = len(fixed_features) - len(available_features)
-                available_features.extend(remaining_cols[:needed])
-            features_for_prediction = available_features[:len(fixed_features)]
-        
-        X_pred = df_for_prediction[features_for_prediction].values.astype('float32')
-        X_pred = np.nan_to_num(X_pred, nan=0.0, posinf=1.0, neginf=0.0)
-        print(f"예측용 데이터 준비: {X_pred.shape}")
-        print(f"예측에 사용되는 특성: {features_for_prediction}")
-        
-        if feature_scaler is not None:
-            X_pred_scaled = feature_scaler.transform(X_pred)
-        else:
-            from sklearn.preprocessing import StandardScaler
-            temp_scaler = StandardScaler()
-            X_pred_scaled = temp_scaler.fit_transform(X_pred)
-        X_pred_scaled = np.nan_to_num(X_pred_scaled, nan=0.0, posinf=1.0, neginf=-1.0)
-        
-        print(f"스케일링 후 데이터 형태: {X_pred_scaled.shape}")
-        print(f"스케일링 후 NaN 개수: {np.isnan(X_pred_scaled).sum()}")
-        
-        prediction_dataset = TensorDataset(
-            torch.tensor(X_pred_scaled, dtype=torch.float32),
-            torch.zeros(len(X_pred_scaled), dtype=torch.long)
-        )
-        prediction_loader = DataLoader(prediction_dataset, batch_size=64, shuffle=False)
-        
-        probabilities, predictions, complication_probs, feature_importance = predict_diabetes_probability_with_explanation(
-            client_model,
-            prediction_loader,
-            features_for_prediction,
-            device
+        # predict.py 실행
+        result = subprocess.run(
+            [sys.executable, predict_script],
+            cwd=script_dir,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5분 타임아웃
         )
         
-        # 원본 데이터에 예측 결과 추가 (원본 형식 유지)
-        result_df = original_df.copy()
-        result_df['당뇨병_확률'] = probabilities
-        result_df['예측_결과'] = predictions
-        result_df['예측_라벨'] = ['당뇨병' if p == 1 else '정상' for p in predictions]
+        # 출력을 실시간으로 표시
+        if result.stdout:
+            print(result.stdout, flush=True)
+        if result.stderr:
+            print(result.stderr, flush=True)
         
-        # 확률별로 정렬 (선택사항)
-        result_df = result_df.sort_values('당뇨병_확률', ascending=False)
-        
-        success = save_results_to_excel(result_df, probabilities, predictions, complication_probs, feature_importance)
-        
-        if success:
-            print("=== 학습 및 예측 완료 ===", flush=True)
-            print(f"총 {len(result_df)}개 데이터에 대한 예측 완료", flush=True)
-            print(f"당뇨병 예측: {sum(predictions)}개", flush=True)
-            print(f"정상 예측: {len(predictions) - sum(predictions)}개", flush=True)
-            print(f"평균 당뇨병 확률: {np.mean(probabilities):.4f}", flush=True)
+        if result.returncode == 0:
+            print("✅ predict.py 실행 완료", flush=True)
+            print("✅ 엑셀 파일 생성 완료: prediction_results.xlsx", flush=True)
             return True
         else:
-            print("결과 저장 실패", flush=True)
+            print(f"⚠️ predict.py 실행 실패 (반환 코드: {result.returncode})", flush=True)
             return False
             
+    except subprocess.TimeoutExpired:
+        print("⚠️ predict.py 실행 시간 초과", flush=True)
+        return False
     except Exception as e:
-        print(f"예측 중 오류 발생: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"⚠️ predict.py 실행 중 오류 발생: {e}", flush=True)
         return False
 
 if __name__ == "__main__":

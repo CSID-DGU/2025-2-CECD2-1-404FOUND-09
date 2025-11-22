@@ -1,6 +1,7 @@
 import math
 import os
 import time
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader, Dataset
+
+# RuntimeWarning 숨기기
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+np.seterr(all='ignore')
 
 
 def _safe_divide(a: pd.Series, b: pd.Series) -> pd.Series:
@@ -248,7 +253,6 @@ def encode_categorical_features(df, categorical_cols, min_freq=0.01, max_unique=
     if not categorical_cols:
         return None
     
-    print(f"범주형 컬럼 ({len(categorical_cols)}개) 인코딩 시작: {categorical_cols[:5]}...", flush=True)
     cat_df = df[categorical_cols].copy().fillna("UNKNOWN")
     
     processed_cols = []
@@ -266,20 +270,16 @@ def encode_categorical_features(df, categorical_cols, min_freq=0.01, max_unique=
         processed_cols.append(col)
     
     encoded = pd.get_dummies(cat_df, columns=processed_cols, drop_first=True, dtype="float32")
-    print(f"범주형 인코딩 완료: 추가 특성 {encoded.shape[1]}개", flush=True)
     return encoded
 
 def load_diabetes_data(csv_path, test_size=0.2, random_state=42, max_features=96, target_col='diabetes_flag'):
-    print(f"데이터 로드 시작: {csv_path}", flush=True)
     df = pd.read_csv(csv_path)
-    print(f"원본 데이터 크기: {df.shape}", flush=True)
     
     # 기본 전처리
     drop_cols = ['encounter_id', 'patient_nbr']
     available_drop_cols = [col for col in drop_cols if col in df.columns]
     if available_drop_cols:
         df = df.drop(columns=available_drop_cols)
-        print(f"제거된 컬럼: {available_drop_cols}", flush=True)
     
     # readmitted 컬럼 처리
     if 'readmitted' in df.columns:
@@ -303,39 +303,26 @@ def load_diabetes_data(csv_path, test_size=0.2, random_state=42, max_features=96
         if col in categorical_cols:
             categorical_cols.remove(col)
     
-    print(f"사용할 특성 컬럼 ({len(numeric_cols)}개): {numeric_cols[:5]}...", flush=True)
-    if categorical_cols:
-        print(f"사용할 범주형 컬럼 ({len(categorical_cols)}개): {categorical_cols[:5]}...", flush=True)
-    else:
-        print("사용할 범주형 컬럼 없음", flush=True)
-    
     # 특성 데이터 추출
     X = df[numeric_cols].values
     if target_col not in df.columns:
         raise ValueError(f"'{target_col}' 컬럼을 찾을 수 없습니다.")
     y = df[target_col].values.astype('int64')
     
-    print(f"특성 데이터 형태: {X.shape}, 레이블 형태: {y.shape}", flush=True)
-    
     # 데이터 품질 검사 및 정리
-    print("데이터 품질 검사 중...", flush=True)
-    
     # 1. NaN 값 처리
     nan_mask = np.isnan(X)
     if nan_mask.any():
-        print(f"NaN 값 발견: {nan_mask.sum()}개", flush=True)
         # 각 컬럼의 중앙값으로 NaN 대체
         for col_idx in range(X.shape[1]):
             col_data = X[:, col_idx]
             if np.isnan(col_data).any():
                 median_val = np.nanmedian(col_data)
                 X[nan_mask[:, col_idx], col_idx] = median_val
-                print(f"컬럼 {col_idx} NaN 값을 {median_val}로 대체", flush=True)
     
     # 2. 무한대 값 처리
     inf_mask = np.isinf(X)
     if inf_mask.any():
-        print(f"무한대 값 발견: {inf_mask.sum()}개", flush=True)
         # 무한대 값을 해당 컬럼의 최대/최소 유한값으로 대체
         for col_idx in range(X.shape[1]):
             col_data = X[:, col_idx]
@@ -346,10 +333,8 @@ def load_diabetes_data(csv_path, test_size=0.2, random_state=42, max_features=96
                     min_finite = np.min(finite_values)
                     X[X[:, col_idx] == np.inf, col_idx] = max_finite
                     X[X[:, col_idx] == -np.inf, col_idx] = min_finite
-                    print(f"컬럼 {col_idx} 무한대 값을 {min_finite}~{max_finite} 범위로 대체", flush=True)
     
     # 3. 극값 처리 (IQR 방법)
-    print("극값 처리 중...", flush=True)
     for col_idx in range(X.shape[1]):
         col_data = X[:, col_idx]
         q25, q75 = np.percentile(col_data, [25, 75])
@@ -361,22 +346,18 @@ def load_diabetes_data(csv_path, test_size=0.2, random_state=42, max_features=96
         if outlier_mask.any():
             X[col_data < lower_bound, col_idx] = lower_bound
             X[col_data > upper_bound, col_idx] = upper_bound
-            print(f"컬럼 {col_idx}: {outlier_mask.sum()}개 극값을 [{lower_bound:.2f}, {upper_bound:.2f}] 범위로 클리핑", flush=True)
     
     # 4. 정규화 (StandardScaler 기본, 보조로 Min-Max)
-    print("데이터 정규화 중...", flush=True)
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
     # 정규화 후에도 NaN/Inf 체크
     if np.isnan(X_scaled).any() or np.isinf(X_scaled).any():
-        print("경고: 정규화 후에도 NaN/Inf 값이 존재합니다. Min-Max 스케일링으로 변경합니다.", flush=True)
         minmax_scaler = MinMaxScaler()
         X_scaled = minmax_scaler.fit_transform(X)
         
         # 여전히 문제가 있다면 수동으로 처리
         if np.isnan(X_scaled).any() or np.isinf(X_scaled).any():
-            print("수동 정규화 수행 중...", flush=True)
             for col_idx in range(X.shape[1]):
                 col_data = X[:, col_idx]
                 col_min, col_max = np.min(col_data), np.max(col_data)
@@ -389,18 +370,14 @@ def load_diabetes_data(csv_path, test_size=0.2, random_state=42, max_features=96
     cat_features = encode_categorical_features(df, categorical_cols, min_freq=0.005, max_unique=40) if categorical_cols else None
     if cat_features is not None:
         X_combined = np.hstack([X_scaled, cat_features.values])
-        print(f"결합된 특성 차원: {X_combined.shape[1]} (수치 {X_scaled.shape[1]} + 범주 {cat_features.shape[1]})", flush=True)
     else:
         X_combined = X_scaled
-        print(f"결합된 특성 차원: {X_combined.shape[1]} (수치형만 사용)", flush=True)
     
     # 5. 특성 선택 (분산 기반 + ANOVA)
-    print("특성 선택 수행 중...", flush=True)
     try:
         variance_selector = VarianceThreshold(threshold=0.01)
         X_var = variance_selector.fit_transform(X_combined)
     except ValueError:
-        print("  경고: VarianceThreshold 적용 실패, 원본 특성 사용", flush=True)
         X_var = X_combined
     
     if X_var.shape[1] == 0:
@@ -412,8 +389,7 @@ def load_diabetes_data(csv_path, test_size=0.2, random_state=42, max_features=96
             select_k = SelectKBest(score_func=f_classif, k=k)
             try:
                 X_selected = select_k.fit_transform(X_var, y)
-            except Exception as e:
-                print(f"  경고: SelectKBest 실패 ({e}), VarianceThreshold 출력 사용", flush=True)
+            except Exception:
                 X_selected = X_var
         else:
             X_selected = X_var
@@ -421,15 +397,6 @@ def load_diabetes_data(csv_path, test_size=0.2, random_state=42, max_features=96
         X_selected = X_var
     
     X_selected = np.nan_to_num(X_selected, nan=0.0, posinf=1.0, neginf=-1.0).astype('float32')
-    print(f"최종 선택된 특성 차원: {X_selected.shape[1]}", flush=True)
-    
-    # 최종 데이터 품질 확인
-    print(f"최종 데이터 통계:", flush=True)
-    print(f"  X 범위: [{np.min(X_selected):.4f}, {np.max(X_selected):.4f}]", flush=True)
-    print(f"  X 평균: {np.mean(X_selected):.4f}, 표준편차: {np.std(X_selected):.4f}", flush=True)
-    print(f"  NaN 개수: {np.isnan(X_selected).sum()}", flush=True)
-    print(f"  Inf 개수: {np.isinf(X_selected).sum()}", flush=True)
-    print(f"  레이블 분포: {np.bincount(y)}", flush=True)
     
     # 보조 라벨 (입원 기간 버킷)
     if 'time_in_hospital' in df.columns:
@@ -468,8 +435,7 @@ def load_diabetes_data(csv_path, test_size=0.2, random_state=42, max_features=96
     try:
         class_weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train)
         class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32)
-    except Exception as exc:
-        print(f"클래스 가중치 계산 실패 ({exc}), 균등 가중치 사용", flush=True)
+    except Exception:
         class_weights_tensor = torch.ones(len(classes), dtype=torch.float32)
     
     train_dataset.class_weights = class_weights_tensor
@@ -477,7 +443,6 @@ def load_diabetes_data(csv_path, test_size=0.2, random_state=42, max_features=96
     train_dataset.selected_feature_dim = X_selected.shape[1]
     test_dataset.selected_feature_dim = X_selected.shape[1]
     
-    print(f"학습 데이터: {len(train_dataset)}개, 테스트 데이터: {len(test_dataset)}개", flush=True)
     return train_dataset, test_dataset
 
 # EnhancerModel 정의 (서버/클라이언트 공통)
@@ -845,37 +810,10 @@ def _calculate_communication_cost(fedet, include_enhancer_download=True, input_d
 
 def train_fedet(fedet, train_loaders, test_loader, num_rounds=30, local_epochs=4, class_weights=None):
     """FedET 완전 훈련"""
-    print("=== FedET (Federated Ensemble Transfer) 훈련 시작 ===")
-    
     # 통신비용 최적화 설정
     use_enhancer_download = True  # Enhancer는 앙상블에 필요하므로 다운로드 필요
     use_compression = True  # FedET에 압축 기법 적용
     compression_ratio = 0.25  # 4배 압축 (8bit 양자화 + 스파시피케이션)
-    
-    print(f"\n[통신비용 최적화 설정]")
-    print(f"  ✓ Enhancer 모델 다운로드: 활성화 (앙상블 예측에 필요)")
-    print(f"  ✓ 클라이언트 모델 크기 최적화: 적용됨 (256→128, 192→96으로 축소)")
-    print(f"  ✓ Enhancer 모델 크기 최적화: 적용됨 (256→128으로 축소)")
-    print(f"  ✓ 모델 압축 기법: {'적용됨' if use_compression else '미적용'} (8bit 양자화 + 스파시피케이션, {compression_ratio*100:.0f}% 크기)")
-    print(f"  ✓ FedAvg 비교: 표준 방식 (float32, 압축 없음)")
-    
-    # 초기 모델 파라미터 정보 출력 (FedAvg는 원래 크기로 계산)
-    comm_info = _calculate_communication_cost(fedet, include_enhancer_download=use_enhancer_download, 
-                                              input_dim=fedet.input_dim, use_compression=use_compression,
-                                              compression_ratio=compression_ratio)
-    print(f"\n[모델 파라미터 정보]")
-    print(f"  클라이언트 모델 파라미터 (각각): {[f'{p:,}' for p in comm_info['client_params']]} (최적화됨)")
-    print(f"  클라이언트 모델 총 파라미터: {sum(comm_info['client_params']):,}개")
-    print(f"  Enhancer 모델 파라미터: {comm_info['enhancer_params']:,}개 (256→128으로 축소)")
-    print(f"  라운드당 전송 파라미터: {sum(comm_info['client_params']) + comm_info['enhancer_params']:,}개")
-    print(f"  라운드당 통신량: {comm_info['total_mb']:.2f} MB")
-    print(f"\n[통신비용 비교 (FedAvg: 표준 방식, FedET: 압축 적용)]")
-    print(f"  FedAvg 라운드당 (표준, float32, 압축 없음): {comm_info['fedavg_total_mb']:.2f} MB")
-    print(f"  현재 FedET 라운드당 (압축 적용): {comm_info['total_mb']:.2f} MB")
-    if comm_info['overhead_ratio'] > 1.0:
-        print(f"  ⚠️  FedAvg(표준) 대비 {comm_info['overhead_ratio']:.2f}배")
-    else:
-        print(f"  ✓ FedAvg(표준) 대비 {comm_info['overhead_ratio']:.2f}배 (압축으로 통신비용 절감!)\n")
     
     def _resolve_weight_tensor(weights):
         if weights is None:
@@ -899,7 +837,6 @@ def train_fedet(fedet, train_loaders, test_loader, num_rounds=30, local_epochs=4
     
     for round_idx in range(num_rounds):
         round_start = time.time()
-        print(f"\n--- Round {round_idx + 1}/{num_rounds} ---")
         
         # 1. 클라이언트별 로컬 훈련
         client_losses = []
@@ -919,7 +856,6 @@ def train_fedet(fedet, train_loaders, test_loader, num_rounds=30, local_epochs=4
                 criterion = nn.CrossEntropyLoss(weight=weight_tensor)
                 
                 total_loss = 0.0
-                print(f"  Client {client_idx + 1}: epochs={dynamic_epochs}, lr={current_lr:.5f}")
                 for epoch in range(dynamic_epochs):
                     for batch_idx, (x, y, stay, readmit, complication) in enumerate(train_loader):
                         x = x.to(fedet.device)
@@ -935,7 +871,6 @@ def train_fedet(fedet, train_loaders, test_loader, num_rounds=30, local_epochs=4
                 denom = max(1, len(train_loader.dataset) * dynamic_epochs)
                 avg_loss = total_loss / denom
                 client_losses.append(avg_loss)
-                print(f"Client {client_idx + 1} Loss: {avg_loss:.4f}")
         
         # 2. Enhancer 모델 훈련 (앙상블 + 전이학습)
         combined_data = []
@@ -944,12 +879,9 @@ def train_fedet(fedet, train_loaders, test_loader, num_rounds=30, local_epochs=4
         
         combined_loader = DataLoader(combined_data, batch_size=32, shuffle=True)
         enhancer_loss = fedet.train_enhancer(combined_loader, round_idx, class_weights=weight_tensor)
-        print(f"Enhancer Loss: {enhancer_loss:.4f}")
         
         # 앙상블 가중치 업데이트
         accuracies = fedet.update_ensemble_weights(test_loader)
-        print(f"Client Accuracies: {[f'{acc:.3f}' for acc in accuracies]}")
-        print(f"Ensemble Weights: {fedet.ensemble_weights.cpu().numpy()}")
         
         # 3. 평가
         metrics = evaluate_fedet(fedet, test_loader, round_idx)
@@ -971,15 +903,9 @@ def train_fedet(fedet, train_loaders, test_loader, num_rounds=30, local_epochs=4
             "total_params_download": comm_cost["enhancer_params"]
         })
         fedet.round_history.append(metrics)
-        print(f"Round {round_idx} Summary | EnhancerAcc: {metrics['enhancer_acc']:.2f}% "
-              f"| EnsembleAcc: {metrics['ensemble_acc']:.2f}% | Time: {round_duration:.1f}s")
-        compression_note = f" (압축 적용: {comm_cost.get('compression_ratio', 1.0)*100:.0f}% 크기)" if comm_cost.get('compression_applied', False) else ""
-        print(f"  통신비용: 업로드 {comm_cost['upload_mb']:.2f}MB | 다운로드 {comm_cost['download_mb']:.2f}MB | 총 {comm_cost['total_mb']:.2f}MB{compression_note}")
-        print(f"  전송 파라미터 수: 업로드 {sum(comm_cost['client_params']):,}개 (클라이언트별: {[f'{p:,}' for p in comm_cost['client_params']]}) | 다운로드 {comm_cost['enhancer_params']:,}개")
-        if comm_cost['overhead_ratio'] > 1.0:
-            print(f"  ⚠️  FedAvg(표준) 대비 {comm_cost['overhead_ratio']:.2f}배 (FedAvg: {comm_cost['fedavg_total_mb']:.2f}MB, 압축 없음)")
-        else:
-            print(f"  ✓ FedAvg(표준) 대비 {comm_cost['overhead_ratio']:.2f}배 (압축으로 통신비용 절감! FedAvg: {comm_cost['fedavg_total_mb']:.2f}MB, 압축 없음)")
+        
+        # 간소화된 로그: Enhancer 정확도와 통신비용만 출력
+        print(f"Round {round_idx + 1}/{num_rounds} | EnhancerAcc: {metrics['enhancer_acc']:.2f}% | 통신비용: {comm_cost['total_mb']:.2f}MB")
 
 def evaluate_fedet(fedet, test_loader, round_idx):
     """FedET 모델 평가"""
@@ -1047,11 +973,7 @@ def evaluate_fedet(fedet, test_loader, round_idx):
         readmit_thr = fedet.best_readmit_threshold
         readmit_thr_acc = fedet.best_readmit_threshold_acc
     
-    print(f"\n=== Round {round_idx} 평가 결과 ===")
-    print(f"Enhancer 모델 정확도: {enhancer_acc:.2f}%")
-    print(f"앙상블 모델 정확도: {ensemble_acc:.2f}%")
-    print(f"Calibrated Threshold (best acc): {best_thr:.3f} -> {thr_acc:.2f}%")
-    print(f"재입원 정확도: {readmit_acc:.2f}% | Readmit Threshold: {readmit_thr:.3f} -> {readmit_thr_acc:.2f}%")
+    # 로그 출력 제거 (간소화)
     return {
         "enhancer_acc": enhancer_acc,
         "ensemble_acc": ensemble_acc,
@@ -1139,15 +1061,13 @@ def export_patient_predictions(
     # CSV 저장 (기존 호환성 유지)
     if output_csv_path:
         df.to_csv(output_csv_path, index=False)
-        print(f"=== 환자별 예측 결과 CSV 저장 완료: {output_csv_path} ({len(df)} rows) ===", flush=True)
     
     # 엑셀 저장 (요청: 단일 XLSX 파일)
     if output_excel_path:
         try:
             df.to_excel(output_excel_path, index=False)
-            print(f"=== 환자별 예측 결과 XLSX 저장 완료: {output_excel_path} ({len(df)} rows) ===", flush=True)
-        except Exception as excel_err:
-            print(f"[경고] XLSX 저장 실패 ({excel_err}), CSV만 유지됩니다.", flush=True)
+        except Exception:
+            pass
 
 # ----------------------------
 # 4. 기존 모델 정의 (SimpleCNN)
@@ -1262,7 +1182,14 @@ def alt_client_update(client_model, global_model, data_loader, criterion,
     optimizer = optim.SGD(client_model.parameters(), lr=0.01, momentum=0.9)
     total_loss = 0.0
     for _ in range(epochs):
-        for x, y, _, _, _ in data_loader:
+        for batch in data_loader:
+            # 데이터셋이 2-tuple (ImprovedDiabetesDataset) 또는 5-tuple (DiabetesDataset) 반환 가능
+            if len(batch) == 2:
+                x, y = batch
+            elif len(batch) == 5:
+                x, y, _, _, _ = batch
+            else:
+                raise ValueError(f"예상치 못한 배치 크기: {len(batch)}")
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             out = client_model(x)
@@ -1287,7 +1214,14 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
     if weight_override is None:
         num_classes = 2
         class_counts = torch.zeros(num_classes)
-        for _, y, _, _, _ in data_loader:
+        for batch in data_loader:
+            # 데이터셋이 2-tuple 또는 5-tuple 반환 가능
+            if len(batch) == 2:
+                _, y = batch
+            elif len(batch) == 5:
+                _, y, _, _, _ = batch
+            else:
+                raise ValueError(f"예상치 못한 배치 크기: {len(batch)}")
             for i in range(num_classes):
                 class_counts[i] += (y == i).sum()
         
@@ -1295,8 +1229,6 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
         class_weights_tensor = total_samples / (class_counts + 1e-8)
         class_weights_tensor = class_weights_tensor / class_weights_tensor.sum() * num_classes
         
-        print(f"  클래스 분포: {class_counts}")
-        print(f"  클래스 가중치: {class_weights_tensor}")
         weight_for_loss = class_weights_tensor.to(device)
     else:
         weight_for_loss = weight_override
@@ -1327,7 +1259,14 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
     
     for epoch in range(epochs):
         epoch_loss = 0.0
-        for x, y, _, _, _ in data_loader:
+        for batch in data_loader:
+            # 데이터셋이 2-tuple (ImprovedDiabetesDataset) 또는 5-tuple (DiabetesDataset) 반환 가능
+            if len(batch) == 2:
+                x, y = batch
+            elif len(batch) == 5:
+                x, y, _, _, _ = batch
+            else:
+                raise ValueError(f"예상치 못한 배치 크기: {len(batch)}")
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             optimizer.zero_grad()
             output = client_model(x)
@@ -1352,45 +1291,39 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
             
             loss.backward()
             
-            # NaN/Inf 체크 (더 상세히)
+            # NaN/Inf 체크
             if torch.isnan(loss).any() or torch.isinf(loss).any():
-                print(f"  경고: NaN/Inf 손실 감지 (loss: {loss.item()}), 배치 건너뛰기", flush=True)
-                optimizer.zero_grad()  # 그래디언트 초기화
+                optimizer.zero_grad()
                 continue
             
             # 그래디언트 NaN/Inf 체크
             has_nan_grad = False
-            for name, param in client_model.named_parameters():
+            for param in client_model.parameters():
                 if param.grad is not None:
                     if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                        print(f"  경고: {name}에서 NaN/Inf 그래디언트 감지", flush=True)
                         has_nan_grad = True
                         break
             
             if has_nan_grad:
-                print(f"  경고: NaN/Inf 그래디언트 감지, 배치 건너뛰기", flush=True)
                 optimizer.zero_grad()
                 continue
             
-            # 그래디언트 클리핑 강화
+            # 그래디언트 클리핑
             grad_norm = torch.nn.utils.clip_grad_norm_(client_model.parameters(), max_norm=0.1)
-            if grad_norm > 10.0:  # 그래디언트 노름이 너무 큰 경우
-                print(f"  경고: 큰 그래디언트 노름 감지 ({grad_norm:.2f}), 배치 건너뛰기", flush=True)
+            if grad_norm > 10.0:
                 optimizer.zero_grad()
                 continue
             
             optimizer.step()
             
-            # 모델 파라미터 NaN/Inf 체크 (업데이트 후)
+            # 모델 파라미터 NaN/Inf 체크
             has_nan_params = False
-            for name, param in client_model.named_parameters():
+            for param in client_model.parameters():
                 if torch.isnan(param).any() or torch.isinf(param).any():
-                    print(f"  경고: {name}에서 NaN/Inf 파라미터 감지", flush=True)
                     has_nan_params = True
                     break
             
             if has_nan_params:
-                print(f"  경고: 모델 파라미터에 NaN/Inf 감지, 학습 중단", flush=True)
                 break
             
             epoch_loss += loss.item() * x.size(0)
@@ -1402,10 +1335,8 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
         if total_samples > 0:
             avg_epoch_loss = epoch_loss / total_samples
             if np.isnan(avg_epoch_loss) or np.isinf(avg_epoch_loss):
-                print(f"  경고: NaN/Inf 손실 감지, 학습 중단")
                 break
         else:
-            print(f"  경고: 유효한 샘플이 없음, 학습 중단")
             break
         
         if avg_epoch_loss < best_loss:
@@ -1415,16 +1346,10 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
             patience_counter += 1
             
         if patience_counter >= patience:
-            print(f"  Early stopping at epoch {epoch} (loss: {avg_epoch_loss:.4f})")
             break
         
-        # 학습률 스케줄링 (에포크 끝에서)
+        # 학습률 스케줄링
         scheduler.step()
-        
-        # 에포크별 손실 출력 (디버깅용)
-        if epoch % 5 == 0:
-            current_lr = scheduler.get_last_lr()[0]
-            print(f"  Epoch {epoch}: Loss = {avg_epoch_loss:.4f}, LR = {current_lr:.6f}")
         
         total_loss += epoch_loss
     
@@ -1505,58 +1430,47 @@ if __name__ == "__main__":
     )
     
     # 최종 평가
-    print("\n=== 최종 FedET 모델 평가 ===")
     evaluate_fedet(fedet, test_loader, 30) 
     
-    # 통신비용 요약
-    print("\n=== 통신비용 요약 ===")
+    # 통신비용 요약 (간소화)
     total_upload = sum(h.get("comm_upload_mb", 0) for h in fedet.round_history)
     total_download = sum(h.get("comm_download_mb", 0) for h in fedet.round_history)
     total_comm = sum(h.get("comm_total_mb", 0) for h in fedet.round_history)
-    avg_per_round = total_comm / len(fedet.round_history) if fedet.round_history else 0
     
-    # 최종 요약: 압축 설정 적용 (기본값 사용)
     comm_info = _calculate_communication_cost(fedet, include_enhancer_download=True, input_dim=fedet.input_dim,
                                               use_compression=True, compression_ratio=0.25)
-    total_upload_params = sum(comm_info['client_params'])
-    print(f"모델 파라미터 정보 (통신비용 최적화 적용):")
-    print(f"  - 클라이언트 모델 파라미터 (각각): {[f'{p:,}' for p in comm_info['client_params']]} (크기 최적화됨)")
-    print(f"  - 클라이언트 모델 총 파라미터 (업로드): {total_upload_params:,}개")
-    print(f"  - Enhancer 모델 파라미터 (다운로드): {comm_info['enhancer_params']:,}개 (256→128으로 축소)")
-    print(f"  - 라운드당 총 전송 파라미터: {total_upload_params + comm_info['enhancer_params']:,}개")
-    compression_note = f" (압축: {comm_info.get('compression_ratio', 1.0)*100:.0f}% 크기, {comm_info.get('fedet_bytes_per_param', 4):.1f} bytes/param)" if comm_info.get('compression_applied', False) else ""
-    print(f"\n라운드당 통신비용:")
-    print(f"  - 업로드: {comm_info['upload_mb']:.2f} MB ({total_upload_params:,} 파라미터 × {comm_info.get('fedet_bytes_per_param', 4):.1f} bytes{compression_note})")
-    print(f"  - 다운로드: {comm_info['download_mb']:.2f} MB ({comm_info['enhancer_params']:,} 파라미터 × {comm_info.get('fedet_bytes_per_param', 4):.1f} bytes{compression_note})")
-    print(f"  - 총: {comm_info['total_mb']:.2f} MB (압축 적용)")
-    print(f"\n통신비용 비교 (FedAvg: 표준 방식, FedET: 압축 적용):")
-    print(f"  - FedAvg 라운드당 (표준, float32, 압축 없음): {comm_info['fedavg_total_mb']:.2f} MB")
-    print(f"  - 현재 FedET 라운드당 (압축 적용): {comm_info['total_mb']:.2f} MB")
-    savings = comm_info['fedavg_total_mb'] - comm_info['total_mb']
-    savings_pct = (savings / comm_info['fedavg_total_mb'] * 100) if comm_info['fedavg_total_mb'] > 0 else 0
-    if comm_info['overhead_ratio'] > 1.0:
-        print(f"  - ⚠️  FedAvg(표준) 대비 {comm_info['overhead_ratio']:.2f}배")
-        print(f"  - 증가 원인: Enhancer 모델 ({comm_info['enhancer_params']:,} 파라미터) 다운로드 포함")
-    else:
-        print(f"  - ✓ FedAvg(표준) 대비 {comm_info['overhead_ratio']:.2f}배 (압축으로 {savings:.2f}MB 절감, {savings_pct:.1f}% 감소)")
-    print(f"\n전체 학습 통신비용 ({len(fedet.round_history)} 라운드):")
-    total_params_upload_all = total_upload_params * len(fedet.round_history)
-    total_params_download_all = comm_info['enhancer_params'] * len(fedet.round_history)
     fedavg_total_all = comm_info['fedavg_total_mb'] * len(fedet.round_history)
-    print(f"  - 총 업로드: {total_upload:.2f} MB ({total_upload/1024:.2f} GB) - {total_params_upload_all:,} 파라미터 전송")
-    print(f"  - 총 다운로드: {total_download:.2f} MB ({total_download/1024:.2f} GB) - {total_params_download_all:,} 파라미터 전송")
-    print(f"  - 총 통신량: {total_comm:.2f} MB ({total_comm/1024:.2f} GB) - {total_params_upload_all + total_params_download_all:,} 파라미터 전송")
-    print(f"  - 라운드당 평균: {avg_per_round:.2f} MB ({total_upload_params + comm_info['enhancer_params']:,} 파라미터/라운드)")
-    print(f"\n전체 학습 통신비용 비교 (FedAvg: 표준 방식, FedET: 압축 적용):")
-    print(f"  - FedAvg 총 통신량 (표준, float32, 압축 없음): {fedavg_total_all:.2f} MB ({fedavg_total_all/1024:.2f} GB)")
-    print(f"  - 현재 FedET 총 통신량 (압축 적용): {total_comm:.2f} MB ({total_comm/1024:.2f} GB)")
-    overhead_total = total_comm / fedavg_total_all if fedavg_total_all > 0 else 1.0
     total_savings = fedavg_total_all - total_comm
     total_savings_pct = (total_savings / fedavg_total_all * 100) if fedavg_total_all > 0 else 0
-    if overhead_total > 1.0:
-        print(f"  - ⚠️  FedAvg(표준) 대비 {overhead_total:.2f}배 증가 (추가 통신량: {total_comm - fedavg_total_all:.2f} MB)")
-    else:
-        print(f"  - ✓ FedAvg(표준) 대비 {overhead_total:.2f}배 (압축으로 {total_savings:.2f}MB 절감, {total_savings_pct:.1f}% 감소)")
+    
+    print(f"\n전체 통신비용: {total_comm:.2f}MB (FedAvg 대비 {total_savings_pct:.1f}% 절감)")
+    
+    # 학습 완료된 Enhancer 모델 저장
+    model_save_path = "trained_enhancer_model.pth"
+    torch.save({
+        'state_dict': fedet.enhancer.state_dict(),
+        'input_dim': input_dim,
+        'num_classes': fedet.num_classes,
+        'hidden_dims': (128, 96, 64),  # 최적화된 크기
+        'dropout_rate': 0.2
+    }, model_save_path)
+    
+    # global_model.pth도 저장 (FedHBClient.py 호환성)
+    global_model_data = {
+        'state_dict': fedet.enhancer.state_dict(),
+        'input_dim': input_dim,
+        'num_classes': fedet.num_classes,
+        'model_type': 'EnhancerModel',
+        'version': '2.0',
+        'hidden_dims': (128, 96, 64),
+        'dropout_rate': 0.2
+    }
+    torch.save(global_model_data, "global_model.pth")
+    
+    # 복호화된 파라미터도 저장 (predict.py 호환성)
+    state_dict = fedet.enhancer.state_dict()
+    flat_params = np.concatenate([param.cpu().numpy().flatten() for param in state_dict.values()])
+    np.save('decrypted_params.npy', flat_params)
     
     # 환자별 확률 Export
     export_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
