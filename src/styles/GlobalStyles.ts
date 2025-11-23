@@ -42,7 +42,9 @@ const GlobalStyles = createGlobalStyle`
     right: 0;
     height: 60px;
     background-color: #ffffff;
+    z-index: 9999;
     padding: 1rem 1.5rem;
+    border-bottom: 1px solid #e5e7eb;
   }
 
   nav .container {

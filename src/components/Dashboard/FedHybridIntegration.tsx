@@ -224,6 +224,7 @@ export default function FedHybridIntegration({
             // "엑셀 파일 생성 완료" 메시지가 포함된 경우에만 학습 완료로 인식
             if (data.message.includes("엑셀 파일 생성 완료")) {
               setTrainingStatus("로컬 학습이 완료되었습니다!");
+              setIsLoading(false);
               // 학습 완료 이벤트 발생 (ExcelResultViewer 새로고침 트리거)
               const trainingCompleteEvent = new CustomEvent("training-complete", {
                 detail: { timestamp: new Date().toISOString() },
@@ -237,6 +238,7 @@ export default function FedHybridIntegration({
             // 학습 성공 메시지
             updateTrainingLog(data.message);
             setTrainingStatus("로컬 학습이 완료되었습니다!");
+            setIsLoading(false);
             // 학습 완료 이벤트 발생
             const trainingCompleteEvent = new CustomEvent("training-complete", {
               detail: { timestamp: new Date().toISOString() },
@@ -471,37 +473,6 @@ export default function FedHybridIntegration({
           </StatusWrapper>
         )}
 
-        {/* 서버 상태 */}
-        <Section>
-          <SectionTitle>서버 상태</SectionTitle>
-          {serverStatus ? (
-            <StatusGrid>
-              <StatusCard>
-                <StatusLabel>현재 라운드</StatusLabel>
-                <StatusValue>{serverStatus.current_round}</StatusValue>
-              </StatusCard>
-              <StatusCard>
-                <StatusLabel>활성 라운드</StatusLabel>
-                <StatusValue>
-                  {Object.keys(serverStatus.active_rounds).length}
-                </StatusValue>
-              </StatusCard>
-              <StatusCard>
-                <StatusLabel>목표 클라이언트</StatusLabel>
-                <StatusValue>
-                  {serverStatus.round_config?.target_clients || "N/A"}
-                </StatusValue>
-              </StatusCard>
-            </StatusGrid>
-          ) : (
-            <NoDataMessage>서버에 연결할 수 없습니다.</NoDataMessage>
-          )}
-
-          <Button onClick={checkServerStatus} disabled={isLoading}>
-            상태 새로고침
-          </Button>
-        </Section>
-
         {/* 파일 업로드 및 로컬 학습 */}
         <Section>
           <SectionTitle>로컬 학습</SectionTitle>
@@ -514,10 +485,6 @@ export default function FedHybridIntegration({
             <p>3. 다운로드한 모델로 로컬에서 학습을 진행합니다.</p>
             <p>4. 학습 완료 후 예측 결과를 생성합니다.</p>
             <p>
-              <strong>
-                ⚠️ 주의: 예측 결과 파일(diabetic_predictions.xlsx,
-                prediction_results.xlsx)은 업로드할 수 없습니다.
-              </strong>
             </p>
           </TrainingDescription>
           <UploadWrapper>
