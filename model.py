@@ -185,7 +185,7 @@ def _compute_optimal_threshold(probabilities: np.ndarray, labels: np.ndarray,
 
 # Diabetes 데이터셋 로딩 함수 및 Dataset 클래스
 class DiabetesDataset(Dataset):
-    def __init__(self, X, y, stay=None, readmit=None, complication=None):
+    def __init__(self, X, y, stay=None, readmit=None, complication=None, sample_weights=None):
         self.X = X.astype('float32')
         self.y = y.astype('int64')
         n = len(X)
@@ -198,15 +198,22 @@ class DiabetesDataset(Dataset):
         self.stay = stay.astype('int64')
         self.readmit = readmit.astype('int64')
         self.complication = complication.astype('int64')
+        if sample_weights is None:
+            sample_weights = np.ones(n, dtype='float32')
+        self.sample_weights = sample_weights.astype('float32')
+        self.num_classes = len(np.unique(y))
+    
     def __len__(self):
         return len(self.X)
+    
     def __getitem__(self, idx):
         return (
-            torch.tensor(self.X[idx]),
-            torch.tensor(self.y[idx]),
-            torch.tensor(self.stay[idx]),
-            torch.tensor(self.readmit[idx]),
-            torch.tensor(self.complication[idx])
+            torch.tensor(self.X[idx], dtype=torch.float32),
+            torch.tensor(self.y[idx], dtype=torch.long),
+            torch.tensor(self.stay[idx], dtype=torch.long),
+            torch.tensor(self.readmit[idx], dtype=torch.long),
+            torch.tensor(self.complication[idx], dtype=torch.long),
+            torch.tensor(self.sample_weights[idx], dtype=torch.float32)
         )
 
 
@@ -408,6 +415,14 @@ def load_diabetes_data(csv_path, test_size=0.2, random_state=42, max_features=96
     else:
         stay_bins = np.zeros(len(df), dtype='int64')
     
+    # diabetesMed 기반 샘플 가중치 계산
+    if 'diabetesMed' in df.columns:
+        diabetes_med_mask = df['diabetesMed'].str.upper().eq('YES').values
+        # diabetesMed == 'YES'인 샘플에 2.0배 가중치, 나머지는 1.0
+        sample_weights = np.where(diabetes_med_mask, 2.0, 1.0).astype('float32')
+    else:
+        sample_weights = np.ones(len(df), dtype='float32')
+    
     # 데이터셋 분할
     split_results = train_test_split(
         X_selected,
@@ -415,6 +430,7 @@ def load_diabetes_data(csv_path, test_size=0.2, random_state=42, max_features=96
         stay_bins,
         readmission_labels,
         complication_labels,
+        sample_weights,
         test_size=test_size,
         random_state=random_state,
         stratify=y
@@ -423,11 +439,12 @@ def load_diabetes_data(csv_path, test_size=0.2, random_state=42, max_features=96
      y_train, y_test,
      stay_train, stay_test,
      readmit_train, readmit_test,
-     comp_train, comp_test) = split_results
+     comp_train, comp_test,
+     weights_train, weights_test) = split_results
     
-    train_dataset = DiabetesDataset(X_train, y_train, stay_train, readmit_train, comp_train)
+    train_dataset = DiabetesDataset(X_train, y_train, stay_train, readmit_train, comp_train, weights_train)
     train_dataset.selected_features = None
-    test_dataset = DiabetesDataset(X_test, y_test, stay_test, readmit_test, comp_test)
+    test_dataset = DiabetesDataset(X_test, y_test, stay_test, readmit_test, comp_test, weights_test)
     test_dataset.selected_features = None
     
     # 클래스 가중치 계산 (전역 공유)
@@ -589,20 +606,32 @@ class FedET:
                 weight_tensor = class_weights.to(self.device)
             else:
                 weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
-        criterion = nn.CrossEntropyLoss(weight=weight_tensor)
-        stay_criterion = nn.CrossEntropyLoss()
-        binary_criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(weight=weight_tensor, reduction='none')
+        stay_criterion = nn.CrossEntropyLoss(reduction='none')
+        binary_criterion = nn.CrossEntropyLoss(reduction='none')
         
         total_loss = 0.0
         total_samples = 0
         epsilon = 1e-8
         
-        for batch_idx, (x, y, stay, readmit, complication) in enumerate(train_loader):
+        for batch_idx, batch in enumerate(train_loader):
+            # 데이터셋이 5-tuple 또는 6-tuple 반환 가능 (sample_weights 포함)
+            if len(batch) == 6:
+                x, y, stay, readmit, complication, sample_weights = batch
+            elif len(batch) == 5:
+                x, y, stay, readmit, complication = batch
+                sample_weights = torch.ones(len(x), dtype=torch.float32)
+            else:
+                x, y = batch[:2]
+                stay = readmit = complication = torch.zeros(len(x), dtype=torch.long)
+                sample_weights = torch.ones(len(x), dtype=torch.float32)
+            
             x = x.to(self.device)
             y = y.to(self.device)
             stay = stay.to(self.device)
             readmit = readmit.to(self.device)
             complication = complication.to(self.device)
+            sample_weights = sample_weights.to(self.device)
             
             # 1. 클라이언트 모델들의 예측 (앙상블)
             client_predictions = []
@@ -622,10 +651,15 @@ class FedET:
             
             # 직접 예측
             enhancer_pred, stay_logits, readmit_logits, complication_logits = self.enhancer(x, return_aux=True)
-            direct_loss = criterion(enhancer_pred, y)
-            stay_loss = stay_criterion(stay_logits, stay)
-            readmit_loss = binary_criterion(readmit_logits, readmit)
-            complication_loss = binary_criterion(complication_logits, complication)
+            # 샘플별 가중치 적용 (diabetesMed == 'YES'인 샘플에 더 높은 가중치)
+            direct_loss_per_sample = criterion(enhancer_pred, y)
+            direct_loss = (direct_loss_per_sample * sample_weights).mean()
+            stay_loss_per_sample = stay_criterion(stay_logits, stay)
+            stay_loss = (stay_loss_per_sample * sample_weights).mean()
+            readmit_loss_per_sample = binary_criterion(readmit_logits, readmit)
+            readmit_loss = (readmit_loss_per_sample * sample_weights).mean()
+            complication_loss_per_sample = binary_criterion(complication_logits, complication)
+            complication_loss = (complication_loss_per_sample * sample_weights).mean()
             
             # 앙상블에서 전이학습
             transfer_loss = F.mse_loss(enhancer_pred, ensemble_pred.detach())
@@ -676,7 +710,14 @@ class FedET:
                 client_model.eval()
                 correct, total = 0, 0
                 
-                for x, y, _, _, _ in validation_loader:
+                for batch in validation_loader:
+                    # 데이터셋이 5-tuple 또는 6-tuple 반환 가능 (sample_weights 포함)
+                    if len(batch) == 6:
+                        x, y, _, _, _, _ = batch
+                    elif len(batch) == 5:
+                        x, y, _, _, _ = batch
+                    else:
+                        x, y = batch[:2]
                     x, y = x.to(self.device), y.to(self.device)
                     pred = client_model(x)
                     pred_class = pred.argmax(1)
@@ -853,16 +894,30 @@ def train_fedet(fedet, train_loaders, test_loader, num_rounds=30, local_epochs=4
                 scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
                     optimizer, T_0=max(1, dynamic_epochs), T_mult=2, eta_min=current_lr * 0.1
                 )
-                criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+                criterion = nn.CrossEntropyLoss(weight=weight_tensor, reduction='none')
                 
                 total_loss = 0.0
                 for epoch in range(dynamic_epochs):
-                    for batch_idx, (x, y, stay, readmit, complication) in enumerate(train_loader):
+                    for batch_idx, batch in enumerate(train_loader):
+                        # 데이터셋이 5-tuple 또는 6-tuple 반환 가능 (sample_weights 포함)
+                        if len(batch) == 6:
+                            x, y, stay, readmit, complication, sample_weights = batch
+                        elif len(batch) == 5:
+                            x, y, stay, readmit, complication = batch
+                            sample_weights = torch.ones(len(x), dtype=torch.float32)
+                        else:
+                            x, y = batch[:2]
+                            sample_weights = torch.ones(len(x), dtype=torch.float32)
+                        
                         x = x.to(fedet.device)
                         y = y.to(fedet.device)
+                        sample_weights = sample_weights.to(fedet.device)
+                        
                         optimizer.zero_grad()
                         out = client_model(x)
-                        loss = criterion(out, y)
+                        # 샘플별 가중치 적용 (diabetesMed == 'YES'인 샘플에 더 높은 가중치)
+                        loss_per_sample = criterion(out, y)
+                        loss = (loss_per_sample * sample_weights).mean()
                         loss.backward()
                         optimizer.step()
                         scheduler.step(epoch + batch_idx / max(1, len(train_loader)))
@@ -919,7 +974,15 @@ def evaluate_fedet(fedet, test_loader, round_idx):
     readmit_probs_list, readmit_labels_list = [], []
     
     with torch.no_grad():
-        for x, y, _, readmit, _ in test_loader:
+        for batch in test_loader:
+            # 데이터셋이 5-tuple 또는 6-tuple 반환 가능 (sample_weights 포함)
+            if len(batch) == 6:
+                x, y, _, readmit, _, _ = batch
+            elif len(batch) == 5:
+                x, y, _, readmit, _ = batch
+            else:
+                x, y = batch[:2]
+                readmit = torch.zeros(len(x), dtype=torch.long)
             x = x.to(fedet.device)
             y = y.to(fedet.device)
             readmit = readmit.to(fedet.device)
@@ -998,7 +1061,15 @@ def export_patient_predictions(
     records = []
     sample_idx = 0
     with torch.no_grad():
-        for x, y, stay, readmit, complication in data_loader:
+        for batch in data_loader:
+            # 데이터셋이 5-tuple 또는 6-tuple 반환 가능 (sample_weights 포함)
+            if len(batch) == 6:
+                x, y, stay, readmit, complication, _ = batch
+            elif len(batch) == 5:
+                x, y, stay, readmit, complication = batch
+            else:
+                x, y = batch[:2]
+                stay = readmit = complication = torch.zeros(len(x), dtype=torch.long)
             x = x.to(fedet.device)
             main_logits, stay_logits, readmit_logits, complication_logits = fedet.predict_with_enhancer(x, return_aux=True)
             
@@ -1233,8 +1304,8 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
     else:
         weight_for_loss = weight_override
     
-    # 가중 손실 함수 사용
-    weighted_criterion = nn.CrossEntropyLoss(weight=weight_for_loss)
+    # 가중 손실 함수 사용 (reduction='none'으로 설정하여 샘플별 loss 계산 가능)
+    weighted_criterion = nn.CrossEntropyLoss(weight=weight_for_loss, reduction='none')
     
     # 모델 가중치 초기화는 첫 라운드에만 수행
     if round_idx == 0:
@@ -1260,17 +1331,24 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
     for epoch in range(epochs):
         epoch_loss = 0.0
         for batch in data_loader:
-            # 데이터셋이 2-tuple (ImprovedDiabetesDataset) 또는 5-tuple (DiabetesDataset) 반환 가능
-            if len(batch) == 2:
-                x, y = batch
+            # 데이터셋이 2-tuple, 5-tuple, 또는 6-tuple 반환 가능 (sample_weights 포함)
+            if len(batch) == 6:
+                x, y, _, _, _, sample_weights = batch
             elif len(batch) == 5:
                 x, y, _, _, _ = batch
+                sample_weights = torch.ones(len(x), dtype=torch.float32)
+            elif len(batch) == 2:
+                x, y = batch
+                sample_weights = torch.ones(len(x), dtype=torch.float32)
             else:
                 raise ValueError(f"예상치 못한 배치 크기: {len(batch)}")
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            sample_weights = sample_weights.to(device)
             optimizer.zero_grad()
             output = client_model(x)
-            loss = weighted_criterion(output, y)  # 가중 손실 사용
+            # 샘플별 가중치 적용 (diabetesMed == 'YES'인 샘플에 더 높은 가중치)
+            loss_per_sample = weighted_criterion(output, y)
+            loss = (loss_per_sample * sample_weights).mean()
             
             # FedProx (활성화)
             if use_fedprox and round_idx > 0:

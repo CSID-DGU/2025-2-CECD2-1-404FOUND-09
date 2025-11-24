@@ -69,11 +69,13 @@ def evaluate_local_accuracy(model, data_loader, device):
     total = 0
     with torch.no_grad():
         for batch in data_loader:
-            # 데이터셋이 2-tuple (ImprovedDiabetesDataset) 또는 5-tuple (DiabetesDataset) 반환 가능
-            if len(batch) == 2:
-                x, y = batch
+            # 데이터셋이 2-tuple, 5-tuple, 또는 6-tuple 반환 가능 (sample_weights 포함)
+            if len(batch) == 6:
+                x, y, _, _, _, _ = batch
             elif len(batch) == 5:
                 x, y, _, _, _ = batch
+            elif len(batch) == 2:
+                x, y = batch
             else:
                 raise ValueError(f"예상치 못한 배치 크기: {len(batch)}")
             
@@ -210,11 +212,13 @@ def predict_diabetes_probability_with_explanation(model, data_loader, feature_na
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(data_loader):
-            # 데이터셋이 2-tuple 또는 5-tuple 반환 가능
-            if len(batch) == 2:
-                x, _ = batch
+            # 데이터셋이 2-tuple, 5-tuple, 또는 6-tuple 반환 가능 (sample_weights 포함)
+            if len(batch) == 6:
+                x, _, _, _, _, _ = batch
             elif len(batch) == 5:
                 x, _, _, _, _ = batch
+            elif len(batch) == 2:
+                x, _ = batch
             else:
                 raise ValueError(f"예상치 못한 배치 크기: {len(batch)}")
             x = x.to(device)
@@ -557,17 +561,48 @@ def main(input_file=None):
     if completed_rounds < NUM_ROUNDS:
         return False
     
-    # 최종 예측 수행 전에 서버에서 최종 모델 다운로드
-    print("=== 최종 모델 다운로드 ===", flush=True)
+    # 학습 완료 후 로컬에서 학습한 모델을 저장 (predict.py에서 사용)
+    print("=== 학습된 모델 저장 ===", flush=True)
+    try:
+        # 로컬에서 학습한 client_model을 global_model.pth로 저장
+        model_data = {
+            'state_dict': client_model.state_dict(),
+            'input_dim': input_dim,
+            'num_classes': 2,
+            'model_type': 'EnhancerModel',
+            'version': '2.0',
+            'hidden_dims': (128, 96, 64),
+            'dropout_rate': 0.2
+        }
+        torch.save(model_data, "global_model.pth")
+        print(f"로컬 학습 모델 저장 완료 (input_dim: {input_dim})", flush=True)
+    except Exception as e:
+        print(f"모델 저장 실패: {e}", flush=True)
+    
+    # 최종 예측 수행 전에 서버에서 최종 모델 다운로드 (선택적)
+    print("=== 최종 모델 다운로드 (선택적) ===", flush=True)
     try:
         state_dict, server_input_dim, has_feature_extractor = download_global_model()
         if server_input_dim == input_dim:
-            global_model.load_state_dict(state_dict, strict=False)
-            print(f"서버 모델 로드 완료 (input_dim: {server_input_dim})", flush=True)
-        else:
-            pass  # warning 메시지 제거
+            # 서버 모델이 더 좋을 수 있으므로 로드 시도
+            try:
+                client_model.load_state_dict(state_dict, strict=False)
+                # 서버 모델로 업데이트된 경우 다시 저장
+                model_data = {
+                    'state_dict': client_model.state_dict(),
+                    'input_dim': input_dim,
+                    'num_classes': 2,
+                    'model_type': 'EnhancerModel',
+                    'version': '2.0',
+                    'hidden_dims': (128, 96, 64),
+                    'dropout_rate': 0.2
+                }
+                torch.save(model_data, "global_model.pth")
+                print(f"서버 모델 로드 및 저장 완료 (input_dim: {server_input_dim})", flush=True)
+            except Exception:
+                pass
     except Exception as e:
-        pass  # warning 메시지 제거
+        pass  # 서버 모델 다운로드 실패는 무시 (로컬 모델 사용)
     
     # predict.py를 호출하여 예측 수행
     print("=== predict.py 실행하여 예측 수행 ===", flush=True)

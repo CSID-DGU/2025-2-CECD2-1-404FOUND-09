@@ -48,139 +48,199 @@ def main():
         test_diabetes_count = np.sum(test_labels == 1)
         print(f"테스트 데이터 당뇨병 비율: {test_diabetes_ratio:.1f}% ({test_diabetes_count}/{len(test_labels)})")
     
-    # 모델 로드: 우선순위 1) global_model.pth, 2) trained_enhancer_model.pth, 3) decrypted_params.npy
+    # 모델 로드: 우선순위 1) trained_enhancer_model.pth, 2) global_model.pth, 3) decrypted_params.npy
+    # trained_enhancer_model.pth를 우선 로드 (input_dim이 맞는 모델)
     model = None
     use_aux_outputs = False  # 보조 출력(합병증, 재입원) 사용 여부
+    model_loaded = False
     
-    if os.path.exists('global_model.pth'):
+    if os.path.exists('trained_enhancer_model.pth'):
+        print("trained_enhancer_model.pth 파일 로드 중...")
+        try:
+            checkpoint = torch.load('trained_enhancer_model.pth', map_location=device)
+            saved_input_dim = checkpoint.get('input_dim', input_dim)
+            
+            # input_dim이 일치하는 경우에만 로드
+            if saved_input_dim == input_dim:
+                hidden_dims = checkpoint.get('hidden_dims', (128, 96, 64))
+                if isinstance(hidden_dims, list):
+                    hidden_dims = tuple(hidden_dims)
+                dropout_rate = checkpoint.get('dropout_rate', 0.2)
+                
+                model = EnhancerModel(
+                    input_dim=input_dim,
+                    num_classes=checkpoint.get('num_classes', num_classes),
+                    hidden_dims=hidden_dims,
+                    dropout_rate=dropout_rate
+                ).to(device)
+                model.load_state_dict(checkpoint['state_dict'])
+                
+                # 모델 검증
+                model.eval()
+                with torch.no_grad():
+                    test_input = torch.randn(1, input_dim).to(device)
+                    test_output = model(test_input)
+                    test_probs = torch.softmax(test_output, dim=1)
+                    print(f"모델 테스트 확률: {test_probs.cpu().numpy()}")
+                
+                first_layer_weight = list(model.parameters())[0]
+                weight_mean = first_layer_weight.mean().item()
+                weight_std = first_layer_weight.std().item()
+                print(f"모델 첫 레이어 가중치 통계: mean={weight_mean:.6f}, std={weight_std:.6f}")
+                
+                if abs(weight_mean) > 0.001 or weight_std > 0.1:
+                    use_aux_outputs = True
+                    model_loaded = True
+                    print(f"trained_enhancer_model.pth 로드 완료: input_dim={input_dim}, num_classes={checkpoint.get('num_classes', num_classes)}")
+                else:
+                    print("경고: trained_enhancer_model.pth의 가중치가 초기화 상태입니다.")
+                    model = None
+            else:
+                print(f"경고: trained_enhancer_model.pth의 input_dim({saved_input_dim})이 실제 데이터({input_dim})와 다릅니다.")
+        except Exception as e:
+            print(f"trained_enhancer_model.pth 로드 실패: {e}")
+    
+    # trained_enhancer_model.pth가 없거나 로드 실패한 경우 global_model.pth 시도
+    if not model_loaded and os.path.exists('global_model.pth'):
         print("global_model.pth 파일 로드 중...")
         checkpoint = torch.load('global_model.pth', map_location=device, weights_only=False)
         model_type = checkpoint.get('model_type', 'Unknown')
-        # 실제 데이터의 input_dim 사용 (저장된 값이 아닌)
+        saved_input_dim = checkpoint.get('input_dim', None)
         saved_num_classes = checkpoint.get('num_classes', num_classes)
         
-        # 합병증/재입원 예측을 위해 항상 EnhancerModel 사용 (보조 출력 있음)
-        # ImprovedEnhancerModel로 저장되어 있어도 EnhancerModel로 로드 시도
-        hidden_dims = checkpoint.get('hidden_dims', (128, 96, 64))
-        if isinstance(hidden_dims, list):
-            hidden_dims = tuple(hidden_dims)
-        dropout_rate = checkpoint.get('dropout_rate', 0.2)
-        
-        model = EnhancerModel(
-            input_dim=input_dim,  # 실제 데이터의 input_dim 사용
-            num_classes=saved_num_classes,
-            hidden_dims=hidden_dims,
-            dropout_rate=dropout_rate
-        ).to(device)
-        
-        # state_dict 로드 시 input_dim이 다른 경우 첫 번째 레이어만 스킵
-        state_dict = checkpoint['state_dict']
-        model_state_dict = model.state_dict()
-        filtered_state_dict = {}
-        skipped_layers = []
-        
-        for key, value in state_dict.items():
-            # ImprovedEnhancerModel의 'feature_extractor'를 EnhancerModel의 'input_projection'으로 매핑
-            mapped_key = key
-            if 'feature_extractor' in key:
-                mapped_key = key.replace('feature_extractor', 'input_projection')
+        # input_dim이 일치하는 경우에만 로드
+        if saved_input_dim == input_dim:
+            hidden_dims = checkpoint.get('hidden_dims', (128, 96, 64))
+            if isinstance(hidden_dims, list):
+                hidden_dims = tuple(hidden_dims)
+            dropout_rate = checkpoint.get('dropout_rate', 0.2)
             
-            if mapped_key in model_state_dict:
-                if model_state_dict[mapped_key].shape == value.shape:
-                    filtered_state_dict[mapped_key] = value
+            model = EnhancerModel(
+                input_dim=input_dim,
+                num_classes=saved_num_classes,
+                hidden_dims=hidden_dims,
+                dropout_rate=dropout_rate
+            ).to(device)
+            
+            # state_dict 로드
+            state_dict = checkpoint['state_dict']
+            model_state_dict = model.state_dict()
+            filtered_state_dict = {}
+            skipped_layers = []
+            
+            for key, value in state_dict.items():
+                # ImprovedEnhancerModel의 'feature_extractor'를 EnhancerModel의 'input_projection'으로 매핑
+                mapped_key = key
+                if 'feature_extractor' in key:
+                    mapped_key = key.replace('feature_extractor', 'input_projection')
+                
+                if mapped_key in model_state_dict:
+                    if model_state_dict[mapped_key].shape == value.shape:
+                        filtered_state_dict[mapped_key] = value
+                    else:
+                        skipped_layers.append(mapped_key)
+                elif key in model_state_dict:
+                    if model_state_dict[key].shape == value.shape:
+                        filtered_state_dict[key] = value
+                    else:
+                        skipped_layers.append(key)
+            
+            model.load_state_dict(filtered_state_dict, strict=False)
+            
+            # 첫 번째 레이어가 스킵되었는지 확인
+            first_layer_skipped = any('input_projection.0.weight' in layer or 'input_projection.0' in layer for layer in skipped_layers)
+            if first_layer_skipped:
+                print(f"경고: 첫 번째 레이어(input_projection.0.weight)가 스킵되었습니다!")
+                print(f"모델이 제대로 작동하지 않을 수 있습니다. trained_enhancer_model.pth를 사용하거나 모델을 다시 학습하세요.")
+                model = None
+            elif skipped_layers:
+                print(f"경고: {len(skipped_layers)}개 레이어가 스킵되었습니다.")
+                if len(skipped_layers) <= 5:
+                    print(f"스킵된 레이어: {skipped_layers}")
                 else:
-                    skipped_layers.append(mapped_key)
-            elif key in model_state_dict:
-                # 원래 키 이름으로도 시도
-                if model_state_dict[key].shape == value.shape:
-                    filtered_state_dict[key] = value
+                    print(f"스킵된 레이어 (처음 5개): {skipped_layers[:5]}...")
+            
+            if model is not None:
+                # 모델 검증
+                model.eval()
+                with torch.no_grad():
+                    test_input = torch.randn(1, input_dim).to(device)
+                    test_output = model(test_input)
+                    test_probs = torch.softmax(test_output, dim=1)
+                    print(f"모델 테스트 출력 shape: {test_output.shape}")
+                    print(f"모델 테스트 확률: {test_probs.cpu().numpy()}")
+                
+                first_layer_weight = list(model.parameters())[0]
+                weight_mean = first_layer_weight.mean().item()
+                weight_std = first_layer_weight.std().item()
+                print(f"모델 첫 레이어 가중치 통계: mean={weight_mean:.6f}, std={weight_std:.6f}")
+                
+                if abs(weight_mean) > 0.001 or weight_std > 0.1:
+                    use_aux_outputs = True
+                    model_loaded = True
+                    print(f"global_model.pth 로드 완료 (보조 출력 활성화): input_dim={input_dim}, num_classes={saved_num_classes}")
                 else:
-                    skipped_layers.append(key)
-            else:
-                # ImprovedEnhancerModel에만 있는 레이어는 스킵
-                pass
-        
-        model.load_state_dict(filtered_state_dict, strict=False)
-        if skipped_layers:
-            pass  # warning 메시지 제거
-        
-        # 모델이 제대로 로드되었는지 확인
-        model.eval()
-        # 샘플 입력으로 테스트
-        with torch.no_grad():
-            test_input = torch.randn(1, input_dim).to(device)
-            test_output = model(test_input)
-            test_probs = torch.softmax(test_output, dim=1)
-            print(f"모델 테스트 출력 shape: {test_output.shape}")
-            print(f"모델 테스트 확률: {test_probs.cpu().numpy()}")
-        
-        # 모델 파라미터가 초기화 상태인지 확인 (첫 번째 레이어의 가중치 확인)
-        first_layer_weight = list(model.parameters())[0]
-        weight_mean = first_layer_weight.mean().item()
-        weight_std = first_layer_weight.std().item()
-        print(f"모델 첫 레이어 가중치 통계: mean={weight_mean:.6f}, std={weight_std:.6f}")
-        if abs(weight_mean) < 0.001 and weight_std < 0.1:
-            print("경고: 모델 가중치가 초기화된 상태로 보입니다. 학습된 모델이 아닐 수 있습니다.")
-        
-        use_aux_outputs = True
-        print(f"EnhancerModel 로드 완료 (보조 출력 활성화): input_dim={input_dim} (실제 데이터), num_classes={saved_num_classes}")
-    elif os.path.exists('trained_enhancer_model.pth'):
-        print("trained_enhancer_model.pth 파일 로드 중...")
-        checkpoint = torch.load('trained_enhancer_model.pth', map_location=device)
-        hidden_dims = checkpoint.get('hidden_dims', (128, 96, 64))
-        dropout_rate = checkpoint.get('dropout_rate', 0.2)
-        model = EnhancerModel(
-            input_dim=checkpoint.get('input_dim', input_dim),
-            num_classes=checkpoint.get('num_classes', num_classes),
-            hidden_dims=hidden_dims,
-            dropout_rate=dropout_rate
-        ).to(device)
-        model.load_state_dict(checkpoint['state_dict'])
-        
-        # 모델 검증
-        model.eval()
-        with torch.no_grad():
-            test_input = torch.randn(1, checkpoint.get('input_dim', input_dim)).to(device)
-            test_output = model(test_input)
-            test_probs = torch.softmax(test_output, dim=1)
-            print(f"모델 테스트 확률: {test_probs.cpu().numpy()}")
-        
-        first_layer_weight = list(model.parameters())[0]
-        weight_mean = first_layer_weight.mean().item()
-        weight_std = first_layer_weight.std().item()
-        print(f"모델 첫 레이어 가중치 통계: mean={weight_mean:.6f}, std={weight_std:.6f}")
-        if abs(weight_mean) < 0.001 and weight_std < 0.1:
-            print("경고: 모델 가중치가 초기화된 상태로 보입니다.")
-        
-        use_aux_outputs = True
-        print(f"EnhancerModel 로드 완료: input_dim={checkpoint.get('input_dim', input_dim)}, num_classes={checkpoint.get('num_classes', num_classes)}")
-    elif os.path.exists('decrypted_params.npy'):
+                    print("경고: 모델 가중치가 초기화된 상태입니다. 모델을 사용할 수 없습니다.")
+                    model = None
+        else:
+            print(f"경고: global_model.pth의 input_dim({saved_input_dim})이 실제 데이터({input_dim})와 다릅니다.")
+            print(f"모델을 로드할 수 없습니다. trained_enhancer_model.pth를 사용하거나 모델을 다시 학습하세요.")
+    
+    # trained_enhancer_model.pth와 global_model.pth 모두 실패한 경우 decrypted_params.npy 시도
+    if not model_loaded and os.path.exists('decrypted_params.npy'):
         print("decrypted_params.npy 파일 로드 중...")
-        model = EnhancerModel(input_dim=input_dim, num_classes=num_classes, hidden_dims=(128, 96, 64), dropout_rate=0.2).to(device)
-        flat_params = np.load('decrypted_params.npy')
-        load_flat_params_to_model(model, flat_params)
-        
-        # 모델 검증
-        model.eval()
-        with torch.no_grad():
-            test_input = torch.randn(1, input_dim).to(device)
-            test_output = model(test_input)
-            test_probs = torch.softmax(test_output, dim=1)
-            print(f"모델 테스트 확률: {test_probs.cpu().numpy()}")
-        
-        first_layer_weight = list(model.parameters())[0]
-        weight_mean = first_layer_weight.mean().item()
-        weight_std = first_layer_weight.std().item()
-        print(f"모델 첫 레이어 가중치 통계: mean={weight_mean:.6f}, std={weight_std:.6f}")
-        if abs(weight_mean) < 0.001 and weight_std < 0.1:
-            print("경고: 모델 가중치가 초기화된 상태로 보입니다.")
-        
-        use_aux_outputs = True
-        print(f"파라미터 로드 완료: {len(flat_params):,} 파라미터")
-    else:
-        print("저장된 모델 파일이 없습니다. 초기화된 모델을 사용합니다.")
-        model = EnhancerModel(input_dim=input_dim, num_classes=num_classes, hidden_dims=(128, 96, 64), dropout_rate=0.2).to(device)
-        use_aux_outputs = True
+        try:
+            model = EnhancerModel(input_dim=input_dim, num_classes=num_classes, hidden_dims=(128, 96, 64), dropout_rate=0.2).to(device)
+            flat_params = np.load('decrypted_params.npy')
+            load_flat_params_to_model(model, flat_params)
+            
+            # 모델 검증
+            model.eval()
+            with torch.no_grad():
+                test_input = torch.randn(1, input_dim).to(device)
+                test_output = model(test_input)
+                test_probs = torch.softmax(test_output, dim=1)
+                print(f"모델 테스트 확률: {test_probs.cpu().numpy()}")
+            
+            first_layer_weight = list(model.parameters())[0]
+            weight_mean = first_layer_weight.mean().item()
+            weight_std = first_layer_weight.std().item()
+            print(f"모델 첫 레이어 가중치 통계: mean={weight_mean:.6f}, std={weight_std:.6f}")
+            
+            if abs(weight_mean) > 0.001 or weight_std > 0.1:
+                use_aux_outputs = True
+                model_loaded = True
+                print(f"파라미터 로드 완료: {len(flat_params):,} 파라미터")
+            else:
+                print("경고: 모델 가중치가 초기화된 상태입니다.")
+                model = None
+        except Exception as e:
+            print(f"decrypted_params.npy 로드 실패: {e}")
+            model = None
+    
+    # 모든 모델 로드 실패
+    if not model_loaded or model is None:
+        print("\n경고: 학습된 모델을 로드할 수 없습니다!")
+        print("가능한 원인:")
+        print("  1. 모델 파일이 없거나 손상되었습니다.")
+        print("  2. 모델의 input_dim이 실제 데이터와 일치하지 않습니다.")
+        print("  3. 모델이 제대로 학습되지 않았습니다.")
+        print("\n해결 방법:")
+        print("  1. FedHBClient.py를 실행하여 모델을 학습하세요.")
+        print("  2. trained_enhancer_model.pth 파일이 있는지 확인하세요.")
+        print("  3. 모델의 input_dim이 실제 데이터와 일치하는지 확인하세요.")
+        return
+    
+    # 모델이 제대로 로드되었는지 최종 확인
+    model.eval()
+    first_layer_weight = list(model.parameters())[0]
+    weight_mean = first_layer_weight.mean().item()
+    weight_std = first_layer_weight.std().item()
+    
+    if abs(weight_mean) < 0.001 and weight_std < 0.1:
+        print("\n경고: 모델 가중치가 초기화된 상태입니다. 예측이 제대로 작동하지 않을 수 있습니다.")
+        print("모델을 다시 학습하거나 올바른 모델 파일을 사용하세요.")
+        return
     
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
     
@@ -192,7 +252,14 @@ def main():
     
     with torch.no_grad():
         first = True
-        for batch_idx, (x, _, _, _, _) in enumerate(test_loader):
+        for batch_idx, batch in enumerate(test_loader):
+            # 데이터셋이 5-tuple 또는 6-tuple 반환 가능 (sample_weights 포함)
+            if len(batch) == 6:
+                x, _, _, _, _, _ = batch
+            elif len(batch) == 5:
+                x, _, _, _, _ = batch
+            else:
+                x = batch[0]
             x = x.to(device)
             
             # === 디버깅: 입력 데이터 확인 (첫 배치만) ===
@@ -239,7 +306,65 @@ def main():
             if batch_idx == 0:
                 print(f"\n=== [디버깅] 모델 출력 (첫 배치) ===")
                 print(f"  main_logits shape: {main_logits.shape}")
-                print(f"  main_logits 샘플 (첫 3개): {main_logits[:3].cpu().numpy()}")
+                print(f"  main_logits 샘플 (첫 5개): {main_logits[:5].cpu().numpy()}")
+                # logits의 다양성 확인
+                logits_np = main_logits.cpu().numpy()
+                print(f"  logits 통계:")
+                print(f"    - min: {logits_np.min():.6f}, max: {logits_np.max():.6f}")
+                print(f"    - mean: {logits_np.mean():.6f}, std: {logits_np.std():.6f}")
+                unique_logits_4 = len(np.unique(np.round(logits_np, 4)))
+                unique_logits_6 = len(np.unique(np.round(logits_np, 6)))
+                print(f"    - 유니크 logits 개수 (소수 4자리): {unique_logits_4}")
+                print(f"    - 유니크 logits 개수 (소수 6자리): {unique_logits_6}")
+                
+                # 모든 logits가 동일한지 확인
+                if unique_logits_4 == 1:
+                    print(f"\n    ⚠️ 경고: 모든 logits가 동일합니다! 모델이 모든 입력에 대해 동일한 출력을 내고 있습니다.")
+                    print(f"    logits 값: {logits_np[0]}")
+                    print(f"    원인 분석:")
+                    print(f"      1. 모델의 첫 번째 레이어(input_projection)가 스킵되어 입력이 무시되고 있습니다.")
+                    print(f"      2. 모델이 제대로 학습되지 않았거나 초기화 상태입니다.")
+                    print(f"      3. 모델의 가중치가 모두 동일하거나 거의 동일합니다.")
+                elif unique_logits_6 == 1:
+                    print(f"    경고: 모든 logits가 거의 동일합니다!")
+                
+                # 첫 5개 샘플의 logits 차이 확인
+                if len(main_logits) >= 5:
+                    for i in range(4):
+                        diff = (main_logits[i] - main_logits[i+1]).abs().sum().item()
+                        print(f"    - 샘플 {i}와 {i+1}의 logits 차이 합: {diff:.6f}")
+                        if diff < 1e-6:
+                            print(f"      경고: 샘플 {i}와 {i+1}의 logits가 거의 동일합니다!")
+                
+                # 입력 데이터 다양성도 확인
+                print(f"\n  입력 데이터 다양성 확인:")
+                x_np = x.cpu().numpy()
+                print(f"    - 입력 shape: {x_np.shape}")
+                print(f"    - 입력 min: {x_np.min():.6f}, max: {x_np.max():.6f}")
+                print(f"    - 입력 mean: {x_np.mean():.6f}, std: {x_np.std():.6f}")
+                if len(x) >= 5:
+                    for i in range(4):
+                        input_diff = (x[i] - x[i+1]).abs().sum().item()
+                        print(f"    - 샘플 {i}와 {i+1}의 입력 차이 합: {input_diff:.6f}")
+                        if input_diff < 1e-6:
+                            print(f"      경고: 샘플 {i}와 {i+1}의 입력이 거의 동일합니다!")
+                
+                # 모델의 중간 출력 확인 (첫 번째 레이어 출력)
+                if hasattr(model, 'input_projection'):
+                    with torch.no_grad():
+                        model.eval()
+                        first_output = model.input_projection(x[:3])
+                        print(f"\n  모델 중간 출력 확인 (input_projection 출력, 첫 3개 샘플):")
+                        print(f"    - shape: {first_output.shape}")
+                        print(f"    - 샘플 0: {first_output[0][:5].cpu().numpy()} ...")
+                        print(f"    - 샘플 1: {first_output[1][:5].cpu().numpy()} ...")
+                        print(f"    - 샘플 2: {first_output[2][:5].cpu().numpy()} ...")
+                        # 첫 번째 레이어 출력이 모두 동일한지 확인
+                        diff_01 = (first_output[0] - first_output[1]).abs().sum().item()
+                        diff_02 = (first_output[0] - first_output[2]).abs().sum().item()
+                        print(f"    - 샘플 간 차이: 0-1={diff_01:.6f}, 0-2={diff_02:.6f}")
+                        if diff_01 < 1e-6 or diff_02 < 1e-6:
+                            print(f"    ⚠️ 경고: input_projection 출력이 동일합니다! 첫 번째 레이어가 제대로 작동하지 않습니다.")
             
             # 모델 출력 안정화: temperature scaling 적용
             temperature = 1.0  # 기본값, 필요시 조정 가능
@@ -256,9 +381,21 @@ def main():
             
             # === 디버깅: 확률 확인 (첫 배치만) ===
             if batch_idx == 0:
+                print(f"\n  === 확률 확인 (첫 배치) ===")
                 print(f"  당뇨병 확률 (첫 10개): {batch_diabetes_probs[:10]}")
                 print(f"  확률 min: {batch_diabetes_probs.min():.6f}, max: {batch_diabetes_probs.max():.6f}")
                 print(f"  확률 mean: {batch_diabetes_probs.mean():.6f}, std: {batch_diabetes_probs.std():.6f}")
+                # 확률이 모두 동일한지 확인
+                unique_probs = np.unique(np.round(batch_diabetes_probs, 6))
+                print(f"  유니크 확률 개수 (소수 6자리): {len(unique_probs)}")
+                if len(unique_probs) == 1:
+                    print(f"  경고: 모든 확률이 동일합니다! ({unique_probs[0]:.6f})")
+                    print(f"  원인 분석:")
+                    print(f"    - 모델이 모든 입력에 대해 동일한 logits를 출력하고 있습니다.")
+                    print(f"    - 모델이 제대로 학습되지 않았거나 초기화 상태일 수 있습니다.")
+                    print(f"    - 모델의 첫 번째 레이어가 스킵되어 입력이 제대로 처리되지 않을 수 있습니다.")
+                elif len(unique_probs) < 5:
+                    print(f"  경고: 확률 다양성이 낮습니다. 유니크 확률: {unique_probs[:10]}")
             
             if readmit_logits is not None:
                 r_prob = torch.softmax(readmit_logits, dim=1)
@@ -291,8 +428,10 @@ def main():
     diabetes_probs_arr = np.array(diabetes_probs)
     print(f"당뇨병 확률:")
     print(f"  - 총 샘플 수: {len(diabetes_probs_arr)}")
-    print(f"  - 유니크 확률 개수 (소수 4자리까지): {len(np.unique(np.round(diabetes_probs_arr, 4)))}")
-    print(f"  - 유니크 확률 개수 (소수 6자리까지): {len(np.unique(np.round(diabetes_probs_arr, 6)))}")
+    unique_4 = len(np.unique(np.round(diabetes_probs_arr, 4)))
+    unique_6 = len(np.unique(np.round(diabetes_probs_arr, 6)))
+    print(f"  - 유니크 확률 개수 (소수 4자리까지): {unique_4}")
+    print(f"  - 유니크 확률 개수 (소수 6자리까지): {unique_6}")
     print(f"  - min: {diabetes_probs_arr.min():.6f}, max: {diabetes_probs_arr.max():.6f}")
     print(f"  - mean: {diabetes_probs_arr.mean():.6f}, std: {diabetes_probs_arr.std():.6f}")
     print(f"  - 중앙값: {np.median(diabetes_probs_arr):.6f}")
@@ -306,12 +445,20 @@ def main():
     print(f"  - 확률 분포: 높음(>=70%): {high_prob_count}개 ({high_prob_count/len(diabetes_probs_arr)*100:.1f}%), "
           f"중간(40-70%): {medium_prob_count}개 ({medium_prob_count/len(diabetes_probs_arr)*100:.1f}%), "
           f"낮음(<40%): {low_prob_count}개 ({low_prob_count/len(diabetes_probs_arr)*100:.1f}%)")
-    if len(np.unique(np.round(diabetes_probs_arr, 4))) == 1:
-        pass  # warning 메시지 제거
-    elif len(np.unique(np.round(diabetes_probs_arr, 6))) == 1:
-        pass  # warning 메시지 제거
-    else:
-        pass
+    
+    # 모든 확률이 동일한지 확인
+    if unique_4 == 1:
+        print(f"\n경고: 모든 확률이 동일합니다! (소수 4자리까지: {np.unique(np.round(diabetes_probs_arr, 4))[0]:.4f})")
+        print("가능한 원인:")
+        print("  1. 모델이 제대로 학습되지 않았을 수 있습니다.")
+        print("  2. 모델의 가중치가 초기화 상태일 수 있습니다.")
+        print("  3. 모든 입력 데이터가 동일하게 전처리되었을 수 있습니다.")
+        print("  4. 모델이 모든 입력에 대해 동일한 출력을 내고 있습니다.")
+    elif unique_6 == 1:
+        print(f"\n경고: 모든 확률이 거의 동일합니다! (소수 6자리까지: {np.unique(np.round(diabetes_probs_arr, 6))[0]:.6f})")
+    elif unique_4 < 10:
+        print(f"\n경고: 확률 다양성이 매우 낮습니다. 유니크 확률 개수: {unique_4}")
+        print(f"유니크 확률 값들 (처음 20개): {np.unique(np.round(diabetes_probs_arr, 4))[:20]}")
     
     if len(complication_probs) > 0 and not all(p == 0.0 for p in complication_probs):
         complication_probs_arr = np.array(complication_probs)
