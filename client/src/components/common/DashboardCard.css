@@ -1,0 +1,41 @@
+.card-wrapper {
+  padding: 2rem 0;
+}
+
+.dashboard-title {
+  font-size: 2rem;
+  font-weight: bold;
+  margin-bottom: 0.25rem;
+}
+
+.dashboard-subtitle {
+  color: #6b7280; 
+  font-size: 0.95rem;
+}
+
+.card-grid {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;     
+  margin: 0;
+}
+
+.card {
+  background-color: #f3f4f6; 
+  padding: 1.25rem 1.5rem;
+  border-radius: 0.5rem;
+  flex: 1 1 160px;
+  min-width: 160px;
+}
+
+.card-title {
+  font-size: 0.95rem;
+  color: #4b5563;
+  margin-bottom: 0.5rem;
+}
+
+.card-value {
+  font-size: 1.3rem;
+  font-weight: bold;
+  color: #111827; 
+}
